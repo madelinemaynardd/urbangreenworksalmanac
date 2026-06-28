@@ -1,0 +1,13 @@
+# SQLite databases — runtime data, regenerated on first run by init_db().
+# IMPORTANT: agrigrant.db holds the Anthropic API key (ai_settings) — never commit it.
+*.db
+*.db-journal
+
+# Logs & Python caches
+server.log
+__pycache__/
+*.pyc
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db

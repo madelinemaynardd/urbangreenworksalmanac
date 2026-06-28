@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Urban GreenWorks Almanac — Manage Data</title>
+  <style>
+    :root {
+      --green-dark:#1e5c2e; --green-mid:#2e7d46; --green-light:#52a869;
+      --gold:#c8991a; --amber:#e8b84b; --red:#c0392b; --blue:#2471a3;
+      --bg:#f4f6f0; --surface:#fff; --border:#d8e0d0; --text:#1a2a1e; --muted:#6b7e72;
+      --radius:10px; --shadow:0 2px 10px rgba(0,0,0,.08);
+    }
+    * { box-sizing:border-box; margin:0; padding:0; }
+    body { font-family:"Segoe UI", system-ui, sans-serif; background:var(--bg); color:var(--text); font-size:14px; }
+    header { background:var(--green-dark); color:#fff; padding:14px 28px; display:flex; align-items:center; justify-content:space-between; }
+    header .logo { font-size:20px; font-weight:700; } header .logo span { color:var(--amber); }
+    header a { color:var(--amber); font-size:12px; text-decoration:none; border:1px solid rgba(232,184,75,.5); border-radius:6px; padding:5px 11px; }
+    header a:hover { background:rgba(232,184,75,.15); }
+
+    .tabs { background:var(--green-mid); padding:0 28px; display:flex; gap:4px; flex-wrap:wrap; }
+    .tab { color:#d4edda; padding:11px 16px; cursor:pointer; font-size:13px; font-weight:600; border-bottom:3px solid transparent; }
+    .tab:hover { color:#fff; } .tab.active { color:#fff; border-bottom-color:var(--amber); }
+
+    .wrap { max-width:1200px; margin:0 auto; padding:22px 28px; display:flex; flex-direction:column; gap:18px; }
+    .section { display:none; flex-direction:column; gap:18px; } .section.active { display:flex; }
+
+    .card { background:var(--surface); border-radius:var(--radius); box-shadow:var(--shadow); border:1px solid var(--border); padding:16px 18px; display:flex; flex-direction:column; gap:12px; overflow-x:auto; }
+    .card-title { font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:.7px; color:var(--green-dark); }
+    .card-note { font-size:12px; color:var(--muted); line-height:1.5; }
+
+    table { width:100%; border-collapse:collapse; font-size:13px; }
+    th { text-align:left; padding:8px 9px; background:#f0f5f1; border-bottom:2px solid var(--border); font-size:10px; text-transform:uppercase; letter-spacing:.5px; color:var(--muted); white-space:nowrap; }
+    td { padding:6px 9px; border-bottom:1px solid var(--border); vertical-align:top; }
+    tr:last-child td { border-bottom:none; }
+
+    input, select, textarea { border:1px solid var(--border); border-radius:6px; padding:5px 8px; font-size:13px; font-family:inherit; width:100%; background:#fff; color:var(--text); }
+    input:focus, select:focus, textarea:focus { outline:2px solid var(--green-light); border-color:transparent; }
+    input.num { max-width:100px; } input.pk { font-weight:600; max-width:120px; }
+    textarea { min-height:54px; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px; }
+    .ro { color:var(--muted); font-weight:600; }
+
+    button { border:none; border-radius:6px; padding:6px 12px; font-size:13px; font-weight:600; cursor:pointer; font-family:inherit; white-space:nowrap; }
+    .btn-save { background:var(--green-mid); color:#fff; } .btn-save:hover { background:var(--green-dark); }
+    .btn-delete { background:#fbeaea; color:var(--red); } .btn-delete:hover { background:var(--red); color:#fff; }
+    .btn-add { background:var(--amber); color:var(--green-dark); } .btn-add:hover { background:var(--gold); color:#fff; }
+    .btn-sync { background:var(--blue); color:#fff; } .btn-sync:hover { filter:brightness(1.1); }
+    .row-actions { display:flex; gap:5px; }
+    .inline-form { display:flex; gap:10px; align-items:flex-end; flex-wrap:wrap; padding-top:6px; border-top:1px dashed var(--border); }
+    .field { display:flex; flex-direction:column; gap:3px; } .field label { font-size:11px; font-weight:600; color:var(--muted); }
+
+    #toast { position:fixed; bottom:24px; right:24px; background:var(--green-dark); color:#fff; padding:10px 18px; border-radius:8px; font-size:13px; box-shadow:var(--shadow); opacity:0; transition:opacity .25s; pointer-events:none; }
+    #toast.show { opacity:1; } #toast.error { background:var(--red); }
+    .pill { font-size:11px; padding:2px 8px; border-radius:12px; background:#eef4ee; color:var(--green-mid); font-weight:600; }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="logo">🌿 <span>Urban GreenWorks</span> Almanac — Manage Data</div>
+  <a href="index.html">← Back to Dashboard</a>
+</header>
+
+<div class="tabs" id="tabs"></div>
+<div class="wrap"><div id="sections"></div></div>
+<div id="toast"></div>
+
+<script>
+const MONTHS=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+const TAB_ORDER=["Crops & Yield","Weather","Soil","Sustainability","Community Impact","Operations","Partners","Roadmap","Dashboard","Integrations"];
+const NUM=new Set(["int","float"]);
+let META=null, activeTab=null;
+
+const esc=s=>String(s??"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+function toast(msg,err=false){ const t=document.getElementById("toast"); t.textContent=msg; t.classList.toggle("error",err); t.classList.add("show"); clearTimeout(t._t); t._t=setTimeout(()=>t.classList.remove("show"),2400); }
+async function api(method,path,body){
+  const res=await fetch(path,{method,headers:body?{"Content-Type":"application/json"}:undefined,body:body?JSON.stringify(body):undefined});
+  const json=await res.json().catch(()=>({})); if(!res.ok) throw new Error(json.error||res.statusText); return json;
+}
+const cssid=c=>c.replace(/[^a-z0-9]/gi,"");
+function tablesByCat(){ const byCat={}; for(const [n,s] of Object.entries(META.tables)){ (byCat[s.category] ||= []).push(n); } return byCat; }
+function currentTablesFor(cat){ return tablesByCat()[cat]||[]; }
+
+// ── boot ─────────────────────────────────────────────
+async function boot(){
+  META = await api("GET","/api/meta");
+  const byCat = tablesByCat();
+  const cats = TAB_ORDER.filter(c=>byCat[c]).concat(Object.keys(byCat).filter(c=>!TAB_ORDER.includes(c)));
+  document.getElementById("tabs").innerHTML = cats.map((c,i)=>`<div class="tab ${i===0?"active":""}" data-cat="${esc(c)}" onclick="showTab('${esc(c)}')">${esc(c)}</div>`).join("");
+  document.getElementById("sections").innerHTML = cats.map((c,i)=>`<div class="section ${i===0?"active":""}" id="sec-${cssid(c)}"></div>`).join("");
+  activeTab=cats[0];
+  for(const c of cats) renderSection(c, byCat[c]);
+}
+function showTab(c){ activeTab=c;
+  document.querySelectorAll(".tab").forEach(t=>t.classList.toggle("active",t.dataset.cat===c));
+  document.querySelectorAll(".section").forEach(s=>s.classList.toggle("active",s.id===`sec-${cssid(c)}`));
+}
+
+async function renderSection(cat, tableNames){
+  const sec=document.getElementById(`sec-${cssid(cat)}`); sec.innerHTML="";
+  if(cat==="Integrations"){ sec.appendChild(await ceraseeCard()); sec.appendChild(uploadCard()); sec.appendChild(sheetsInfoCard()); }
+  if(cat==="Weather"){ sec.appendChild(await weatherSyncCard()); }
+  for(const name of tableNames){
+    if(name==="crop_yield"){ sec.appendChild(await yieldPanel()); continue; }
+    if(name==="widgets"){ sec.appendChild(await widgetsCard()); continue; }
+    sec.appendChild(await tableCard(name));
+  }
+}
+
+// ── friendly widgets editor: rename + retitle + set units ────────────────────
+async function widgetsCard(){
+  const ws = await api("GET","/api/data/widgets");
+  ws.sort((a,b)=>a.position-b.position || a.id-b.id);
+  const card=document.createElement("div"); card.className="card";
+  const rows = ws.map(w=>{
+    const cfg = (w.config && typeof w.config==="object") ? w.config : {};
+    const unit = cfg.unit || "";
+    const cfgStr = esc(JSON.stringify(cfg));
+    return `<tr data-id="${w.id}">
+      <td><input data-f="title" value="${esc(w.title)}" style="min-width:200px"></td>
+      <td><input data-f="unit" value="${esc(unit)}" placeholder="lbs, %, $…" class="num" title="Unit shown on this widget's values"></td>
+      <td><input data-f="category" value="${esc(w.category)}" style="max-width:140px"></td>
+      <td><span class="ro">${esc(w.type)}</span></td>
+      <td><span class="ro">${esc(w.source)}</span></td>
+      <td><input data-f="position" class="num" type="number" value="${w.position}" style="max-width:64px"></td>
+      <td><input data-f="minimized" type="checkbox" ${w.minimized?"checked":""} style="width:auto"></td>
+      <td><textarea data-f="config" title="Advanced: full config JSON (maximize panels, filters, spans…)">${cfgStr}</textarea></td>
+      <td class="row-actions">
+        <button class="btn-save" onclick="saveWidget('${w.id}',this)">Save</button>
+        <button class="btn-delete" onclick="deleteRow('widgets','${w.id}')">✕</button></td>
+    </tr>`;
+  }).join("");
+  card.innerHTML=`<div class="card-title">Widgets <span class="pill">widgets</span></div>
+    <div class="card-note">Rename a widget (<b>Title</b>) and set the <b>Unit</b> shown on its values — these take effect on the dashboard immediately. <b>Type</b> and <b>Source</b> are fixed. The <b>config</b> column is advanced JSON (maximize panels, filters, span); the Unit field and config stay in sync on save.</div>
+    <table><thead><tr><th>Title</th><th>Unit</th><th>Category</th><th>Type</th><th>Source</th><th>Pos</th><th>Min</th><th>config (advanced)</th><th></th></tr></thead>
+    <tbody>${rows}</tbody></table>`;
+  return card;
+}
+async function saveWidget(id, btn){
+  const tr=btn.closest("tr");
+  const get=f=>tr.querySelector(`[data-f="${f}"]`);
+  let cfg={};
+  try { cfg=JSON.parse(get("config").value||"{}"); } catch(e){ return toast("config is not valid JSON",true); }
+  const unit=get("unit").value.trim();
+  if(unit) cfg.unit=unit; else delete cfg.unit;
+  const body={
+    title: get("title").value,
+    category: get("category").value,
+    position: Number(get("position").value)||0,
+    minimized: get("minimized").checked?1:0,
+    config: JSON.stringify(cfg),
+  };
+  try{ await api("PUT",`/api/data/widgets/${id}`,body); toast(`Saved widget · ${body.title}`); }
+  catch(e){ toast(e.message,true); }
+}
+
+// ── Live weather sync (Open-Meteo + NWS) ─────────────
+async function weatherSyncCard(){
+  let st={}; try{ st=await api("GET","/api/weather/status"); }catch(e){}
+  const card=document.createElement("div"); card.className="card";
+  card.innerHTML=`<div class="card-title">🌦️ Live Miami Weather</div>
+    <div class="card-note">
+      Pulls real Miami climate — rainfall &amp; temperature by month — from <b>Open-Meteo</b>, and active watches/warnings from the U.S. <b>National Weather Service</b>. No API key needed.
+      It runs automatically when the server starts and once a day; press the button to refresh now.<br>
+      Last sync: <b>${esc(st.last_sync||"never (will sync shortly after startup)")}</b>.
+      <br><i>Note: a sync replaces the Weather Alerts list with the current NWS alerts.</i>
+    </div>
+    <button class="btn-sync" onclick="syncWeather(this)">🔄 Sync live weather now</button>`;
+  return card;
+}
+async function syncWeather(btn){
+  btn.disabled=true; const old=btn.textContent; btn.textContent="Fetching…";
+  toast("Fetching live Miami weather…");
+  try{ const r=await api("POST","/api/weather/sync"); toast(r.message||"Weather updated");
+    renderSection("Weather", currentTablesFor("Weather")); }
+  catch(e){ toast(e.message,true); btn.disabled=false; btn.textContent=old; }
+}
+
+// ── Cerasee AI assistant config ──────────────────────
+const AI_MODELS = [
+  ["claude-opus-4-8","Claude Opus 4.8 — most capable (recommended)"],
+  ["claude-sonnet-4-6","Claude Sonnet 4.6 — balanced speed & cost"],
+  ["claude-haiku-4-5","Claude Haiku 4.5 — fastest & cheapest"],
+];
+async function ceraseeCard(){
+  let status={configured:false, model:"claude-opus-4-8"};
+  try { status = await api("GET","/api/ai/status"); } catch(e){}
+  const card=document.createElement("div"); card.className="card";
+  card.innerHTML=`<div class="card-title">🌿 Cerasee — AI Assistant</div>
+    <div class="card-note">
+      Cerasee is the dashboard's built-in assistant (the <b>"Ask Cerasee"</b> button on the dashboard). It answers questions about your live farm data — crops, soil, harvests, budget, community impact.
+      Add your <b>Anthropic API key</b> to enable it. The key is stored on the backend only and is never returned to the dashboard.
+      Status: <b style="color:${status.configured?'var(--green-mid)':'var(--red)'}">${status.configured?'✓ Configured — ready to chat':'Not configured'}</b>.
+    </div>
+    <div class="inline-form" style="border-top:none">
+      <div class="field"><label>Anthropic API key</label><input id="ai-key" type="password" placeholder="${status.configured?'•••••••• (leave blank to keep current)':'sk-ant-…'}" style="min-width:260px"></div>
+      <div class="field"><label>Model</label><select id="ai-model">${AI_MODELS.map(([v,l])=>`<option value="${v}" ${v===status.model?'selected':''}>${esc(l)}</option>`).join("")}</select></div>
+      <button class="btn-save" onclick="saveCerasee()">Save</button>
+    </div>
+    <div class="card-note">Get a key at <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">console.anthropic.com</a>. Model choice affects cost &amp; speed — Opus is most capable; Haiku is cheapest.</div>`;
+  return card;
+}
+async function saveCerasee(){
+  const key=document.getElementById("ai-key").value.trim();
+  const model=document.getElementById("ai-model").value;
+  const body={model}; if(key) body.api_key=key;
+  try{ await api("PUT","/api/ai/config",body); toast("Cerasee settings saved 🌿"); renderSection("Integrations", currentTablesFor("Integrations")); }
+  catch(e){ toast(e.message,true); }
+}
+
+// ── file upload (Excel / CSV → any table) ────────────
+const IMPORT_TABLES = ["crops","crop_yield","beds","sustainability","soil_tests",
+  "community","tasks","budget","milestones","inputs","partners","crop_log","harvest_trend"];
+function uploadCard(){
+  const card=document.createElement("div"); card.className="card";
+  const opts=IMPORT_TABLES.filter(t=>META.tables[t]).map(t=>{
+    const cols=Object.keys(META.tables[t].cols).join(", ");
+    return `<option value="${t}" data-cols="${esc(cols)}">${esc(META.tables[t].label)} (${t})</option>`;
+  }).join("");
+  card.innerHTML=`<div class="card-title">⬆ Upload Excel / CSV to update the dashboard</div>
+    <div class="card-note">Drop in a spreadsheet to refresh data <b>without rebuilding the dashboard</b>. Choose the table it belongs to, pick a <b>.xlsx</b> or <b>.csv</b> file, and Import. The first row must be column headers matching the field names below; rows with a matching primary key are updated, new ones are added.</div>
+    <div class="inline-form" style="border-top:none">
+      <div class="field"><label>Update which data?</label><select id="up-table" onchange="showCols()">${opts}</select></div>
+      <div class="field"><label>File (.xlsx or .csv)</label><input id="up-file" type="file" accept=".xlsx,.csv,.txt"></div>
+      <button class="btn-add" onclick="uploadFile()">Import file</button>
+    </div>
+    <div class="card-note" id="up-cols"></div>`;
+  setTimeout(showCols,0);
+  return card;
+}
+function showCols(){
+  const sel=document.getElementById("up-table"); if(!sel) return;
+  const cols=sel.selectedOptions[0].dataset.cols;
+  document.getElementById("up-cols").innerHTML=`Expected column headers: <code>${esc(cols)}</code>`;
+}
+async function uploadFile(){
+  const table=document.getElementById("up-table").value;
+  const f=document.getElementById("up-file").files[0];
+  if(!f) return toast("Choose a .xlsx or .csv file first",true);
+  toast(`Uploading ${f.name}…`);
+  try{
+    const res=await fetch(`/api/upload?table=${encodeURIComponent(table)}&name=${encodeURIComponent(f.name)}`,
+      {method:"POST", body:f});
+    const j=await res.json().catch(()=>({})); if(!res.ok) throw new Error(j.error||res.statusText);
+    toast(j.message || `Imported ${j.count} rows`);
+    renderSection(activeTab, currentTablesFor(activeTab));
+  }catch(e){ toast(e.message,true); }
+}
+
+// ── generic table editor (meta-driven) ───────────────
+async function tableCard(name){
+  const spec=META.tables[name];
+  const cols=Object.keys(spec.cols);
+  const rows=await api("GET",`/api/data/${name}`);
+  const card=document.createElement("div"); card.className="card";
+  const head = cols.map(c=>`<th>${esc(c)}</th>`).join("") + "<th></th>";
+  const bodyRows = rows.map(r=>rowHtml(name,spec,cols,r)).join("");
+  const extra = name==="sheets" ? `<button class="btn-sync" onclick="syncAll(event)">⟳ Sync all now</button>` : "";
+  card.innerHTML = `<div class="card-title">${esc(spec.label)} <span class="pill">${name}</span></div>
+    ${name==="widgets"?`<div class="card-note">Each widget's <b>config</b> is JSON. For crop widgets, edit <code>maximize.panels</code> to control the expanded view, e.g. <code>["yield_chart","nutrition","culture","herbal","economics"]</code>.</div>`:""}
+    <table><thead><tr>${head}</tr></thead><tbody>${bodyRows}</tbody></table>
+    ${addFormHtml(name,spec,cols)} ${extra}`;
+  return card;
+}
+
+function cellInput(name, spec, col, val, isNew){
+  const t=spec.cols[col];
+  const isPk = col===spec.pk;
+  if(isPk && !isNew){
+    if(spec.auto) return `<span class="ro">${esc(val)}</span>`;
+    return `<span class="ro">${esc(val)}</span>`;        // text PK fixed once created
+  }
+  if(isPk && isNew && spec.auto) return `<span class="ro">auto</span>`;
+  if(col==="enabled"||col==="minimized"||col==="active")
+    return `<input type="checkbox" data-f="${col}" ${Number(val)?"checked":""} style="width:auto">`;
+  if(col==="severity"&&name==="weather_alerts")
+    return select(col,["warning","watch","advisory","info"],val);
+  if(col==="type"&&name==="weather_alerts")
+    return select(col,["hurricane","flood","drought","heat","frost","wind","storm"],val);
+  if(col==="last_synced"||col==="last_status")
+    return `<span class="ro">${esc(val||"—")}</span>`;
+  if(col==="state"&&name==="milestones")
+    return select(col,["done","active","pending"],val);
+  if(col==="status"&&name==="roadmap")
+    return select(col,["idea","planned","in-progress","live"],val);
+  if(col==="status")
+    return select(col,["on-track","at-risk","delayed","complete","pending","active"],val);
+  if(col==="target_table"&&name==="sheets")
+    return select(col,Object.keys(META.tables),val);
+  if(t==="json")
+    return `<textarea data-f="${col}" style="min-width:240px">${esc(typeof val==="object"?JSON.stringify(val):(val||"{}"))}</textarea>`;
+  if(NUM.has(t))
+    return `<input class="num" type="number" step="any" data-f="${col}" value="${val??0}">`;
+  const wide = ["nutrition","culture","herbal","notes","contribution","csv_url","title","contact"].includes(col);
+  return `<input data-f="${col}" value="${esc(val)}" ${isPk?'class="pk"':(wide?'style="min-width:200px"':"")}>`;
+}
+function select(col,opts,val){
+  return `<select data-f="${col}">${opts.map(o=>`<option ${o===val?"selected":""}>${o}</option>`).join("")}</select>`;
+}
+function rowHtml(name,spec,cols,r){
+  const pk=r[spec.pk];
+  const cells=cols.map(c=>`<td>${cellInput(name,spec,c,r[c],false)}</td>`).join("");
+  const sync = name==="sheets" ? `<button class="btn-sync" onclick="syncOne('${esc(r.target_table)}',event)">⟳</button>` : "";
+  return `<tr data-pk="${esc(pk)}">${cells}<td class="row-actions">
+    <button class="btn-save" onclick="saveRow('${name}',this)">Save</button>${sync}
+    <button class="btn-delete" onclick="deleteRow('${name}','${esc(pk)}')">✕</button></td></tr>`;
+}
+function addFormHtml(name,spec,cols){
+  const editable=cols.filter(c=>!(c===spec.pk&&spec.auto)&&c!=="last_synced"&&c!=="last_status");
+  const fields=editable.map(c=>`<div class="field"><label>${esc(c)}</label>${cellInput(name,spec,c,c==="config"?"{}":(c==="enabled"||c==="minimized"||c==="position"?0:""),true)}</div>`).join("");
+  return `<div class="inline-form" data-add="${name}">${fields}<button class="btn-add" onclick="addRow('${name}',this)">＋ Add</button></div>`;
+}
+
+function collect(scope){
+  const out={};
+  scope.querySelectorAll("[data-f]").forEach(el=>{
+    if(el.tagName==="SPAN") return;
+    if(el.type==="checkbox") out[el.dataset.f]=el.checked?1:0;
+    else if(el.type==="number") out[el.dataset.f]=Number(el.value)||0;
+    else out[el.dataset.f]=el.value;
+  });
+  return out;
+}
+async function saveRow(name,btn){
+  const tr=btn.closest("tr"); const pk=tr.dataset.pk;
+  try{ await api("PUT",`/api/data/${name}/${encodeURIComponent(pk)}`,collect(tr)); toast(`Saved ${name} · ${pk}`); }
+  catch(e){ toast(e.message,true); }
+}
+async function deleteRow(name,pk){
+  if(!confirm(`Delete ${name} "${pk}"?`)) return;
+  try{ await api("DELETE",`/api/data/${name}/${encodeURIComponent(pk)}`); toast(`Deleted ${pk}`); renderSection(activeTab, currentTablesFor(activeTab)); }
+  catch(e){ toast(e.message,true); }
+}
+async function addRow(name,btn){
+  const form=btn.closest("[data-add]"); const body=collect(form);
+  const spec=META.tables[name];
+  if(!spec.auto && !body[spec.pk]){ return toast(`${spec.pk} is required`,true); }
+  try{ await api("POST",`/api/data/${name}`,body); toast(`Added to ${name}`); renderSection(activeTab, currentTablesFor(activeTab)); }
+  catch(e){ toast(e.message,true); }
+}
+
+// ── monthly harvest panel ────────────────────────────
+async function yieldPanel(){
+  const crops=await api("GET","/api/data/crops");
+  const yld=await api("GET","/api/data/crop_yield");
+  const card=document.createElement("div"); card.className="card";
+  card.innerHTML=`<div class="card-title">Monthly Harvest (lbs) <span class="pill">crop_yield</span></div>
+    <div class="card-note">Set the harvest for a crop in a given month. This drives the "Monthly Harvest by Crop" chart and the per-crop maximize view.</div>
+    <div class="inline-form" style="border-top:none">
+      <div class="field"><label>Crop</label><select id="y-crop">${crops.map(c=>`<option value="${esc(c.id)}">${esc(c.name)}</option>`).join("")}</select></div>
+      <div class="field"><label>Month</label><select id="y-month">${MONTHS.map((m,i)=>`<option value="${i+1}">${m}</option>`).join("")}</select></div>
+      <div class="field"><label>Pounds</label><input class="num" id="y-lbs" type="number" step="any" value="0"></div>
+      <button class="btn-save" onclick="saveYield()">Save harvest</button>
+    </div>
+    <div class="card-note" id="y-current"></div>`;
+  setTimeout(()=>{
+    const series={}; yld.forEach(r=>{ (series[r.crop_id]||=Array(12).fill(0))[r.month-1]=r.lbs; });
+    const upd=()=>{ const c=document.getElementById("y-crop").value, m=Number(document.getElementById("y-month").value);
+      const cur=(series[c]||[])[m-1]||0; document.getElementById("y-lbs").value=cur;
+      document.getElementById("y-current").textContent=`Current: ${cur} lbs in ${MONTHS[m-1]}`; };
+    document.getElementById("y-crop").onchange=upd; document.getElementById("y-month").onchange=upd; upd();
+  },0);
+  return card;
+}
+async function saveYield(){
+  const body={ crop_id:document.getElementById("y-crop").value, month:Number(document.getElementById("y-month").value), lbs:Number(document.getElementById("y-lbs").value)||0 };
+  try{ await api("PUT","/api/yield",body); toast(`Saved harvest for ${body.crop_id}`); renderSection("Crops & Yield", currentTablesFor("Crops & Yield")); }
+  catch(e){ toast(e.message,true); }
+}
+
+// ── Google Sheets sync ───────────────────────────────
+function sheetsInfoCard(){
+  const card=document.createElement("div"); card.className="card";
+  card.innerHTML=`<div class="card-title">📈 Google Sheets — Weekly Auto-Sync</div>
+    <div class="card-note">
+      The backend re-pulls every <b>enabled</b> sheet <b>once a week</b>, and you can press <b>Sync now</b> any time.
+      No Google login is needed — just publish each sheet as CSV:<br>
+      <b>1.</b> In Google Sheets open <i>File → Share → Publish to web</i>.<br>
+      <b>2.</b> Choose the tab, pick <b>Comma-separated values (.csv)</b>, click <b>Publish</b>, copy the link.<br>
+      <b>3.</b> Paste it into <b>csv_url</b> below, tick <b>enabled</b>, Save, then <b>Sync now</b>.<br>
+      Column headers in the sheet must match the table's field names (e.g. a Crops sheet needs an <code>id</code> column). Matching rows are updated; new ones are added.
+    </div>`;
+  return card;
+}
+async function syncOne(table,ev){
+  ev && ev.preventDefault();
+  toast(`Syncing ${table}…`);
+  try{ const r=await api("POST",`/api/sync?table=${encodeURIComponent(table)}`); const s=(r.results[0]||{}).status||"done"; toast(`${table}: ${s}`); renderSection("Integrations",currentTablesFor("Integrations")); }
+  catch(e){ toast(e.message,true); }
+}
+async function syncAll(ev){
+  ev && ev.preventDefault(); toast("Syncing all enabled sheets…");
+  try{ const r=await api("POST","/api/sync?table=all"); toast(`Synced ${r.results.length} sheet(s)`); renderSection("Integrations",currentTablesFor("Integrations")); }
+  catch(e){ toast(e.message,true); }
+}
+
+boot().catch(e=>toast("Failed to load: "+e.message,true));
+</script>
+</body>
+</html>

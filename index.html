@@ -1,0 +1,1037 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Urban GreenWorks Almanac — Cerasee Farm</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --green-dark:#1e5c2e; --green-mid:#2e7d46; --green-light:#52a869; --green-pale:#a8d5b5;
+      --gold:#c8991a; --amber:#e8b84b; --red:#c0392b; --blue:#2471a3;
+      --bg:#f4f6f0; --surface:#fff; --border:#d8e0d0; --text:#1a2a1e; --muted:#6b7e72;
+      --radius:10px; --shadow:0 2px 10px rgba(0,0,0,.08);
+    }
+    * { box-sizing:border-box; margin:0; padding:0; }
+    body { font-family:"Segoe UI", system-ui, sans-serif; background:var(--bg); color:var(--text); font-size:14px; }
+
+    /* Header */
+    header { background:var(--green-dark); color:#fff; padding:12px 24px; display:flex; align-items:center; justify-content:space-between; gap:12px; }
+    header .logo { font-size:19px; font-weight:700; letter-spacing:.4px; }
+    header .logo span { color:var(--amber); }
+    header .sub { font-size:11px; opacity:.7; margin-top:2px; }
+    header .right { display:flex; align-items:center; gap:14px; }
+    header a.admin-link { color:var(--amber); font-size:12px; text-decoration:none; border:1px solid rgba(232,184,75,.5); border-radius:6px; padding:5px 11px; }
+    header a.admin-link:hover { background:rgba(232,184,75,.15); }
+    header .meta { font-size:11px; opacity:.8; text-align:right; }
+    .badge { background:var(--amber); color:var(--green-dark); border-radius:20px; padding:3px 10px; font-size:11px; font-weight:700; }
+    .badge.offline { background:var(--red); color:#fff; }
+
+    /* Shell */
+    .shell { display:flex; align-items:flex-start; }
+
+    /* Sidebar */
+    .sidebar { width:230px; flex-shrink:0; background:var(--surface); border-right:1px solid var(--border); height:100vh; overflow-y:auto; padding:16px 12px; position:sticky; top:0; }
+    .sidebar::-webkit-scrollbar { width:8px; }
+    .sidebar::-webkit-scrollbar-thumb { background:#d8e0d0; border-radius:8px; }
+    .sidebar::-webkit-scrollbar-thumb:hover { background:#bcc9b4; }
+    .sidebar h3 { font-size:10px; text-transform:uppercase; letter-spacing:.8px; color:var(--muted); margin:14px 6px 6px; }
+    .nav-item { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:8px 10px; border-radius:8px; cursor:pointer; font-size:13px; color:var(--text); }
+    .nav-item:hover { background:#eef4ee; }
+    .nav-item.active { background:var(--green-mid); color:#fff; font-weight:600; }
+    .nav-item .count { font-size:11px; background:#eef4ee; color:var(--muted); border-radius:20px; padding:1px 8px; }
+    .nav-item.active .count { background:rgba(255,255,255,.25); color:#fff; }
+    .add-btn { width:100%; background:var(--amber); color:var(--green-dark); border:none; border-radius:8px; padding:10px; font-size:13px; font-weight:700; cursor:pointer; }
+    .add-btn:hover { background:var(--gold); color:#fff; }
+    .side-filter { margin:6px; }
+    .side-filter label { display:block; font-size:11px; font-weight:600; color:var(--muted); margin:8px 0 3px; }
+    .side-filter select { width:100%; padding:6px 8px; border:1px solid var(--border); border-radius:6px; font-size:13px; background:#fff; color:var(--text); }
+    .restore-list { margin:4px 6px; }
+    .restore-chip { display:inline-flex; align-items:center; gap:5px; font-size:11px; background:#eef4ee; color:var(--muted); border:1px dashed var(--border); border-radius:14px; padding:3px 9px; margin:3px 3px 0 0; cursor:pointer; }
+    .restore-chip:hover { background:var(--green-pale); color:var(--green-dark); }
+
+    /* Main area — masonry layout (cards are absolutely positioned by JS so they
+       pack into the shortest column instead of anchoring to row tops) */
+    .main { flex:1; padding:18px 22px; min-width:0; }
+    .dashboard { position:relative; }
+    .chart-box { position:relative; width:100%; }
+
+    /* Widget card */
+    .widget { position:absolute; background:var(--surface); border-radius:var(--radius); box-shadow:var(--shadow); border:1px solid var(--border); display:flex; flex-direction:column; min-width:0; }
+    .dashboard.ready .widget { transition:top .25s ease, left .25s ease, width .25s ease; }
+    .widget-head { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:12px 14px 6px; }
+    .widget-title { font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.7px; color:var(--muted); }
+    .widget-actions { display:flex; gap:2px; opacity:.5; transition:opacity .15s; }
+    .widget:hover .widget-actions { opacity:1; }
+    .widget-actions button { border:none; background:transparent; cursor:pointer; font-size:13px; color:var(--muted); padding:2px 5px; border-radius:5px; line-height:1; }
+    .widget-actions button:hover { background:#eef4ee; color:var(--green-dark); }
+    .widget-body { padding:4px 16px 16px; display:flex; flex-direction:column; gap:10px; flex:1; }
+    .widget { align-self:start; }   /* don't stretch to the tallest card in the row */
+
+    /* Minimized widgets live in the tray (title only), not the grid */
+    .min-tray { display:none; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:16px; padding:10px 12px; background:var(--surface); border:1px dashed var(--border); border-radius:var(--radius); }
+    .min-tray .tray-label { font-size:10px; text-transform:uppercase; letter-spacing:.8px; color:var(--muted); font-weight:700; margin-right:4px; }
+    .min-chip { display:inline-flex; align-items:center; font-size:12px; background:#fff; border:1px solid var(--border); border-left:4px solid var(--muted); border-radius:16px; padding:5px 13px; cursor:pointer; }
+    .min-chip > span { color:var(--text); cursor:pointer; }
+    .min-chip:hover { background:#f0f5f1; }
+
+    /* Drag & drop reordering */
+    .widget-head { cursor:grab; }
+    .widget-head:active { cursor:grabbing; }
+    .widget.dragging { opacity:.4; }
+    .widget.drag-over { outline:2px dashed var(--green-light); outline-offset:3px; }
+
+    /* Category legend */
+    .cat-legend { display:flex; flex-direction:column; gap:5px; margin:4px 6px; }
+    .legend-item { display:flex; align-items:center; gap:7px; font-size:11px; color:var(--muted); }
+    .legend-dot { width:11px; height:11px; border-radius:3px; flex-shrink:0; }
+
+    /* Data roadmap (future-assets wishlist) */
+    .sidebar h3.rm-toggle { display:flex; align-items:center; justify-content:space-between; cursor:pointer; user-select:none; }
+    .sidebar h3.rm-toggle:hover { color:var(--green-mid); }
+    .sidebar h3.rm-toggle .count { background:#eef4ee; color:var(--muted); border-radius:20px; padding:1px 8px; font-size:10px; }
+    #rm-caret { display:inline-block; transition:transform .15s; }
+    #rm-caret.open { transform:rotate(90deg); }
+    .roadmap { margin:2px 6px 8px; display:flex; flex-direction:column; gap:7px; }
+    .rm-item { display:flex; gap:7px; align-items:flex-start; }
+    .rm-dot { width:9px; height:9px; border-radius:50%; flex-shrink:0; margin-top:4px; }
+    .rm-idea { background:#b0b8b0; } .rm-planned { background:var(--blue); }
+    .rm-in-progress { background:var(--amber); } .rm-live { background:var(--green-mid); }
+    .rm-name { font-size:12px; font-weight:600; color:var(--text); line-height:1.3; }
+    .rm-note { font-size:10.5px; color:var(--muted); line-height:1.35; margin-top:1px; }
+    .rm-cat { font-size:9.5px; color:var(--green-mid); text-transform:uppercase; letter-spacing:.4px; }
+    .rm-manage { display:inline-block; margin-top:4px; font-size:11px; color:var(--green-mid); text-decoration:none; }
+    .rm-manage:hover { text-decoration:underline; }
+    .rm-legend { display:flex; flex-wrap:wrap; gap:8px; font-size:9.5px; color:var(--muted); margin-top:2px; }
+    .rm-legend span { display:flex; align-items:center; gap:3px; }
+
+    .kpi-value { font-size:30px; font-weight:700; color:var(--green-dark); line-height:1; }
+    .kpi-sub { font-size:12px; color:var(--muted); }
+
+    /* tables */
+    .data-table { width:100%; border-collapse:collapse; font-size:13px; }
+    .data-table th { text-align:left; padding:7px 9px; background:#f0f5f1; border-bottom:2px solid var(--border); font-size:10px; text-transform:uppercase; letter-spacing:.5px; color:var(--muted); }
+    .data-table td { padding:7px 9px; border-bottom:1px solid var(--border); }
+    .data-table tr:last-child td { border-bottom:none; }
+    .data-table tr:hover td { background:#f8fbf8; }
+    .status-pill { display:inline-block; padding:2px 8px; border-radius:20px; font-size:11px; font-weight:600; }
+    .pill-on-track{background:#d4edda;color:#155724;} .pill-at-risk{background:#fff3cd;color:#856404;}
+    .pill-delayed{background:#f8d7da;color:#721c24;} .pill-complete{background:#cce5ff;color:#004085;}
+    .pill-pending{background:#e2e3e5;color:#383d41;} .pill-active{background:#d4edda;color:#155724;}
+    .pill-done{background:#cce5ff;color:#004085;}
+
+    /* progress */
+    .progress-row { display:flex; flex-direction:column; gap:3px; margin-bottom:8px; }
+    .progress-label { display:flex; justify-content:space-between; font-size:12px; }
+    .progress-bar { height:10px; border-radius:999px; background:#e5ece7; overflow:hidden; }
+    .progress-fill { height:100%; border-radius:999px; transition:width .6s ease; }
+
+    /* map */
+    .map-placeholder { flex:1; border-radius:8px; background:linear-gradient(135deg,#c8e6c9,#a5d6a7); position:relative; overflow:hidden; min-height:240px; }
+    .map-placeholder::before { content:""; position:absolute; inset:0; background-image:
+      radial-gradient(circle at 30% 40%,rgba(46,125,70,.3) 55px,transparent 56px),
+      radial-gradient(circle at 65% 62%,rgba(46,125,70,.22) 45px,transparent 46px),
+      radial-gradient(circle at 78% 30%,rgba(46,125,70,.28) 35px,transparent 36px); }
+    .pin { position:absolute; width:14px; height:14px; border-radius:50% 50% 50% 0; transform:rotate(-45deg); border:2px solid #fff; }
+    .pin::after { content:attr(data-label); position:absolute; top:-24px; left:50%; transform:translateX(-50%) rotate(45deg); background:rgba(0,0,0,.72); color:#fff; padding:2px 5px; border-radius:4px; font-size:10px; white-space:nowrap; }
+    .pin-on-track{background:var(--green-dark);} .pin-at-risk{background:var(--gold);} .pin-delayed{background:var(--red);}
+    .pin-complete{background:var(--blue);} .pin-pending{background:#888;}
+    .map-legend { position:absolute; bottom:8px; left:8px; display:flex; gap:8px; font-size:11px; color:#1a2a1e; }
+
+    /* timeline */
+    .tl-item { display:flex; gap:12px; align-items:flex-start; margin-bottom:10px; }
+    .tl-dot { width:12px; height:12px; border-radius:50%; flex-shrink:0; margin-top:3px; border:2px solid #fff; box-shadow:0 0 0 2px var(--border); }
+    .tl-dot.done{background:var(--green-mid);box-shadow:0 0 0 2px var(--green-light);}
+    .tl-dot.active{background:var(--amber);box-shadow:0 0 0 2px var(--gold);}
+    .tl-dot.pending{background:#ccc;}
+    .tl-body h4 { font-size:13px; font-weight:600; } .tl-body p { font-size:11px; color:var(--muted); }
+
+    /* list (tasks / partners) */
+    .list-item { display:flex; gap:10px; align-items:flex-start; padding:8px 0; border-bottom:1px solid var(--border); }
+    .list-item:last-child { border-bottom:none; }
+    .list-item .li-main { flex:1; } .list-item h4 { font-size:13px; font-weight:600; }
+    .list-item p { font-size:11px; color:var(--muted); margin-top:2px; }
+    .li-tag { font-size:10px; text-transform:uppercase; letter-spacing:.5px; padding:2px 7px; border-radius:12px; background:#eef4ee; color:var(--green-mid); font-weight:600; white-space:nowrap; }
+    .alert-live { color:var(--red); font-size:10px; font-weight:700; }
+
+    /* library */
+    .lib-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); gap:10px; }
+    .lib-card { border:1px solid var(--border); border-radius:8px; padding:10px; cursor:pointer; transition:.15s; }
+    .lib-card:hover { border-color:var(--green-light); box-shadow:var(--shadow); }
+    .lib-card h4 { font-size:13px; color:var(--green-dark); }
+    .lib-card .lib-type { font-size:10px; color:var(--muted); text-transform:uppercase; letter-spacing:.5px; }
+    .lib-card p { font-size:11px; color:var(--muted); margin-top:5px; line-height:1.35; }
+
+    /* gauge */
+    .gauge-wrap { display:flex; justify-content:center; align-items:center; flex:1; }
+    .gauge-wrap canvas { max-width:180px; }
+
+    /* modal */
+    .overlay { position:fixed; inset:0; background:rgba(20,30,22,.55); display:none; align-items:center; justify-content:center; z-index:50; padding:24px; }
+    .overlay.open { display:flex; }
+    .modal { background:var(--surface); border-radius:14px; box-shadow:0 12px 40px rgba(0,0,0,.3); max-width:980px; width:100%; max-height:90vh; overflow:auto; }
+    .modal-head { display:flex; align-items:center; justify-content:space-between; padding:18px 24px; border-bottom:1px solid var(--border); position:sticky; top:0; background:var(--surface); }
+    .modal-head h2 { font-size:18px; color:var(--green-dark); }
+    .modal-close { border:none; background:#eef4ee; border-radius:8px; width:34px; height:34px; cursor:pointer; font-size:18px; color:var(--muted); }
+    .modal-close:hover { background:var(--red); color:#fff; }
+    .modal-body { padding:22px 24px; }
+    .detail-panels { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:16px; }
+    .panel { border:1px solid var(--border); border-radius:10px; padding:14px 16px; }
+    .panel h4 { font-size:11px; text-transform:uppercase; letter-spacing:.7px; color:var(--muted); margin-bottom:8px; }
+    .panel p { font-size:13px; line-height:1.5; }
+    .panel.full { grid-column:1 / -1; }
+    .econ-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; }
+    .econ-cell { text-align:center; }
+    .econ-cell .v { font-size:22px; font-weight:700; color:var(--green-dark); }
+    .econ-cell .l { font-size:11px; color:var(--muted); }
+    .crop-select { padding:8px 12px; border:1px solid var(--border); border-radius:8px; font-size:14px; min-width:240px; background:#fff; }
+
+    /* catalog */
+    .cat-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:12px; }
+    .cat-card { border:1px solid var(--border); border-radius:10px; padding:14px; }
+    .cat-card h4 { font-size:14px; color:var(--green-dark); margin-bottom:4px; }
+    .cat-card .cat-meta { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.5px; }
+    .cat-card button { margin-top:10px; width:100%; background:var(--green-mid); color:#fff; border:none; border-radius:7px; padding:8px; font-weight:600; cursor:pointer; }
+    .cat-card button:hover { background:var(--green-dark); }
+
+    #toast { position:fixed; bottom:24px; right:24px; background:var(--green-dark); color:#fff; padding:10px 18px; border-radius:8px; font-size:13px; box-shadow:var(--shadow); opacity:0; transition:opacity .25s; pointer-events:none; z-index:80; }
+    #toast.show { opacity:1; } #toast.error { background:var(--red); }
+
+    @media (max-width:1100px){ .dashboard{grid-template-columns:repeat(2,1fr);} .span-3,.span-4{grid-column:span 2;} }
+    @media (max-width:720px){ .sidebar{display:none;} .dashboard{grid-template-columns:1fr;} .span-2,.span-3,.span-4{grid-column:span 1;} .detail-panels,.econ-grid{grid-template-columns:1fr;} }
+
+    /* ── Cerasee AI assistant ── */
+    #cerasee-fab { position:fixed; bottom:22px; right:22px; z-index:90; background:var(--green-dark); color:#fff; border:none; border-radius:30px; padding:12px 20px; font-size:14px; font-weight:700; font-family:inherit; cursor:pointer; box-shadow:0 6px 20px rgba(0,0,0,.25); display:flex; align-items:center; gap:6px; }
+    #cerasee-fab:hover { background:var(--green-mid); transform:translateY(-1px); }
+    #cerasee-panel { position:fixed; bottom:22px; right:22px; z-index:95; width:380px; max-width:calc(100vw - 32px); height:560px; max-height:calc(100vh - 80px); background:var(--surface); border-radius:16px; box-shadow:0 14px 44px rgba(0,0,0,.32); border:1px solid var(--border); display:none; flex-direction:column; overflow:hidden; }
+    #cerasee-panel.open { display:flex; }
+    .cer-head { background:var(--green-dark); color:#fff; padding:14px 16px; display:flex; align-items:center; justify-content:space-between; }
+    .cer-head .cer-leaf { font-size:18px; }
+    .cer-head strong { color:var(--amber); }
+    .cer-sub { font-size:11px; opacity:.7; margin-top:2px; }
+    .cer-close { background:rgba(255,255,255,.12); border:none; color:#fff; width:30px; height:30px; border-radius:8px; cursor:pointer; font-size:15px; }
+    .cer-close:hover { background:rgba(255,255,255,.25); }
+    .cer-body { flex:1; overflow-y:auto; padding:16px; display:flex; flex-direction:column; gap:12px; background:#f7faf6; }
+    .cer-msg { max-width:85%; padding:10px 13px; border-radius:14px; font-size:13.5px; line-height:1.5; white-space:pre-wrap; word-wrap:break-word; }
+    .cer-msg.user { align-self:flex-end; background:var(--green-mid); color:#fff; border-bottom-right-radius:4px; }
+    .cer-msg.bot { align-self:flex-start; background:#fff; border:1px solid var(--border); color:var(--text); border-bottom-left-radius:4px; }
+    .cer-msg.bot.err { background:#fbeaea; border-color:#f1c5c0; color:#7a241c; }
+    .cer-typing { align-self:flex-start; color:var(--muted); font-size:13px; font-style:italic; }
+    .cer-greet { text-align:center; color:var(--muted); font-size:12px; padding:6px 10px; }
+    .cer-chips { display:flex; flex-wrap:wrap; gap:6px; justify-content:center; margin-top:2px; }
+    .cer-chip { font-size:11.5px; background:#eef4ee; border:1px solid var(--border); color:var(--green-mid); border-radius:14px; padding:5px 10px; cursor:pointer; }
+    .cer-chip:hover { background:var(--green-pale); color:var(--green-dark); }
+    .cer-foot { border-top:1px solid var(--border); padding:10px; background:var(--surface); }
+    .cer-inputrow { display:flex; gap:8px; }
+    .cer-inputrow input { flex:1; border:1px solid var(--border); border-radius:20px; padding:9px 14px; font-size:13.5px; font-family:inherit; outline:none; }
+    .cer-inputrow input:focus { border-color:var(--green-light); box-shadow:0 0 0 2px rgba(82,168,105,.2); }
+    .cer-send { background:var(--green-mid); color:#fff; border:none; border-radius:50%; width:38px; height:38px; cursor:pointer; font-size:16px; flex-shrink:0; }
+    .cer-send:hover { background:var(--green-dark); }
+    .cer-setup { display:flex; flex-direction:column; gap:8px; }
+    .cer-setup p { font-size:12.5px; color:var(--muted); line-height:1.5; }
+    .cer-setup input { border:1px solid var(--border); border-radius:8px; padding:8px 10px; font-size:13px; font-family:inherit; }
+    .cer-setup button { background:var(--amber); color:var(--green-dark); border:none; border-radius:8px; padding:9px; font-weight:700; cursor:pointer; font-size:13px; }
+    .cer-setup button:hover { background:var(--gold); color:#fff; }
+    .cer-setup a { color:var(--green-mid); }
+  </style>
+</head>
+<body>
+
+<header>
+  <div>
+    <div class="logo">🌿 <span>Urban GreenWorks</span> Almanac</div>
+    <div class="sub">Cerasee Farm &amp; Urban GreenWorks · Liberty City · USDA Sustainable Agriculture Grant</div>
+  </div>
+  <div class="right">
+    <a class="admin-link" href="admin.html">⚙ Manage Data</a>
+    <div class="meta">
+      <div>SQLite · Google Sheets weekly sync</div>
+      <div>Last refresh: <strong id="last-sync">—</strong></div>
+    </div>
+    <span class="badge" id="live-badge">⟳ Live</span>
+  </div>
+</header>
+
+<div class="shell">
+  <!-- ── Sidebar ── -->
+  <aside class="sidebar">
+    <button class="add-btn" onclick="openCatalog()">＋ Add Widget</button>
+    <h3>Categories</h3>
+    <div id="nav"></div>
+    <h3>Filters</h3>
+    <div class="side-filter">
+      <label>Crop</label>
+      <select id="filter-crop"><option value="">All crops</option></select>
+      <label>Plot / bed status</label>
+      <select id="filter-status">
+        <option value="">All statuses</option>
+        <option value="on-track">On Track</option>
+        <option value="at-risk">At Risk</option>
+        <option value="delayed">Delayed</option>
+        <option value="complete">Complete</option>
+        <option value="pending">Pending</option>
+      </select>
+    </div>
+    <h3>Legend</h3>
+    <div id="cat-legend" class="cat-legend"></div>
+
+    <h3 class="rm-toggle" id="rm-toggle" onclick="toggleRoadmap()">
+      <span><span id="rm-caret">▸</span> Data Roadmap</span>
+      <span class="count" id="rm-count">0</span>
+    </h3>
+    <div id="roadmap" class="roadmap" style="display:none"></div>
+  </aside>
+
+  <!-- ── Main ── -->
+  <main class="main">
+    <div class="min-tray" id="min-tray"></div>
+    <div class="dashboard" id="dashboard"></div>
+  </main>
+</div>
+
+<!-- Maximize modal -->
+<div class="overlay" id="max-overlay">
+  <div class="modal">
+    <div class="modal-head">
+      <h2 id="max-title">Widget</h2>
+      <button class="modal-close" onclick="closeMax()">✕</button>
+    </div>
+    <div class="modal-body" id="max-body"></div>
+  </div>
+</div>
+
+<!-- Add-widget catalog modal -->
+<div class="overlay" id="cat-overlay">
+  <div class="modal">
+    <div class="modal-head">
+      <h2>Add a Widget</h2>
+      <button class="modal-close" onclick="closeCatalog()">✕</button>
+    </div>
+    <div class="modal-body"><div class="cat-grid" id="cat-grid"></div></div>
+  </div>
+</div>
+
+<!-- ── Cerasee AI assistant ── -->
+<button id="cerasee-fab" onclick="toggleCerasee()" title="Ask Cerasee">🌿 Ask Cerasee</button>
+<div id="cerasee-panel" aria-hidden="true">
+  <div class="cer-head">
+    <div><span class="cer-leaf">🌿</span> Ask <strong>Cerasee</strong><div class="cer-sub">Your farm-data assistant</div></div>
+    <button class="cer-close" onclick="toggleCerasee()" title="Close">✕</button>
+  </div>
+  <div class="cer-body" id="cer-body"></div>
+  <div class="cer-foot" id="cer-foot"></div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+const C = { greenDark:"#1e5c2e", greenMid:"#2e7d46", greenLight:"#52a869", greenPale:"#a8d5b5",
+            gold:"#c8991a", amber:"#e8b84b", red:"#c0392b", blue:"#2471a3", muted:"#6b7e72" };
+const PALETTE = [C.greenMid, C.gold, C.greenLight, C.blue, C.amber, C.red, C.greenDark, C.muted];
+const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+const statusLabel = { "on-track":"On Track","at-risk":"At Risk","delayed":"Delayed","complete":"Complete","pending":"Pending","active":"Active","done":"Done" };
+
+// Earth-tone accent per category
+const CAT_COLORS = {
+  "Overview":"#a9743b", "Crops & Yield":"#5b8c3e", "Weather":"#5b7a99", "Soil":"#8a5a2b",
+  "Sustainability":"#7d8c3a", "Community Impact":"#bb5a3c", "Operations":"#c08a2d",
+  "Partners":"#4a7c6f", "Dashboard":"#6b7e72", "Integrations":"#6b7e72"
+};
+function catColor(c){ return CAT_COLORS[c] || "#6b7e72"; }
+// Units applied to bare values shown in tables/charts
+const UNITS = { harvested:"units", seedlings:"cells", yield_lbs:"lbs", beds:"beds",
+                size_sqft:"sq ft", acres:"ac", units:"units" };
+
+const fmt = n => Number(n||0).toLocaleString("en-US",{maximumFractionDigits:1});
+const money = n => "$"+Number(n||0).toLocaleString("en-US",{maximumFractionDigits:0});
+const esc = s => String(s??"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+
+let DATA = null;
+let filters = { crop:"", status:"" };
+let activeCat = "All";
+let layoutSig = "";
+const charts = {};        // widgetId -> Chart
+let catalog = [];
+
+async function api(method, path, body) {
+  const res = await fetch(path, {
+    method, headers: body ? {"Content-Type":"application/json"} : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const json = await res.json().catch(()=>({}));
+  if (!res.ok) throw new Error(json.error || res.statusText);
+  return json;
+}
+function toast(msg, err=false){ const t=document.getElementById("toast"); t.textContent=msg; t.classList.toggle("error",err); t.classList.add("show"); clearTimeout(t._t); t._t=setTimeout(()=>t.classList.remove("show"),2200); }
+
+// ── data helpers ─────────────────────────────────────
+function cropsFiltered(){
+  return DATA.crops.filter(c =>
+    (!filters.crop || c.name===filters.crop) &&
+    (!filters.status || c.status===filters.status));
+}
+function bedsFiltered(){
+  const allowed = new Set(cropsFiltered().map(c=>c.id));
+  return DATA.beds.filter(b =>
+    (!filters.crop || allowed.has(b.crop_id)) &&
+    (!filters.status || b.status===filters.status));
+}
+function cropName(id){ const c=DATA.crops.find(x=>x.id===id); return c?c.name:id; }
+function scalar(source){
+  const [ns,key] = source.split(":");
+  if (ns==="kpi")    return DATA.kpis[key];
+  if (ns==="community"){ const r=DATA.community.find(c=>c.metric===key); return r?r.value:0; }
+  if (ns==="sustain"){ const r=DATA.sustainability.find(s=>s.metric===key); return r?r.value:0; }
+  return 0;
+}
+function tableData(source){
+  if (source==="crops") return cropsFiltered();
+  if (source==="beds")  return bedsFiltered();
+  return DATA[source] || [];
+}
+// config-driven row filtering: {filter:{col:val}}, {exclude:{col:[vals]}}, {limit:N}
+function applyCfg(rows, cfg){
+  let out = rows.slice();
+  if (cfg.filter)  out = out.filter(r => Object.entries(cfg.filter).every(([k,v]) => String(r[k])===String(v)));
+  if (cfg.exclude) out = out.filter(r => Object.entries(cfg.exclude).every(([k,vals]) => !vals.map(String).includes(String(r[k]))));
+  if (cfg.limit){
+    if (cfg.value) out = out.sort((a,b)=>Number(b[cfg.value])-Number(a[cfg.value]));
+    out = out.slice(0, cfg.limit);
+  }
+  return out;
+}
+
+// ── categories / sidebar ─────────────────────────────
+function visibleWidgets(){
+  let ws = DATA.widgets.slice().sort((a,b)=>a.position-b.position || a.id-b.id);
+  if (activeCat!=="All") ws = ws.filter(w=>w.category===activeCat);
+  return ws;
+}
+function renderNav(){
+  const cats = {};
+  DATA.widgets.forEach(w => cats[w.category]=(cats[w.category]||0)+1);
+  const order = ["Overview","Crops & Yield","Weather","Soil","Sustainability","Community Impact","Operations","Partners"];
+  const names = ["All", ...order.filter(c=>cats[c]), ...Object.keys(cats).filter(c=>!order.includes(c))];
+  document.getElementById("nav").innerHTML = names.map(c => {
+    const n = c==="All" ? DATA.widgets.length : (cats[c]||0);
+    return `<div class="nav-item ${c===activeCat?"active":""}" onclick="setCat('${esc(c)}')">
+      <span>${esc(c)}</span><span class="count">${n}</span></div>`;
+  }).join("");
+
+  // earth-tone legend for the categories that are in use
+  const used = names.filter(c=>c!=="All");
+  document.getElementById("cat-legend").innerHTML = used.map(c=>
+    `<div class="legend-item"><span class="legend-dot" style="background:${catColor(c)}"></span>${esc(c)}</div>`).join("");
+}
+function setCat(c){ activeCat=c; renderNav(); rebuild(); }
+
+// ── Data roadmap (future-assets wishlist) ────────────
+let roadmapOpen = false;
+const rmStatusLabel = { idea:"Idea", planned:"Planned", "in-progress":"In progress", live:"Live" };
+function toggleRoadmap(){
+  roadmapOpen = !roadmapOpen;
+  document.getElementById("roadmap").style.display = roadmapOpen ? "flex" : "none";
+  document.getElementById("rm-caret").classList.toggle("open", roadmapOpen);
+}
+function renderRoadmap(){
+  const items = DATA.roadmap || [];
+  document.getElementById("rm-count").textContent = items.length;
+  const order = { live:0, "in-progress":1, planned:2, idea:3 };
+  const sorted = items.slice().sort((a,b)=>(order[a.status]??9)-(order[b.status]??9));
+  document.getElementById("roadmap").innerHTML =
+    `<div class="rm-legend">
+       <span><span class="rm-dot rm-idea"></span>Idea</span>
+       <span><span class="rm-dot rm-planned"></span>Planned</span>
+       <span><span class="rm-dot rm-in-progress"></span>In progress</span>
+       <span><span class="rm-dot rm-live"></span>Live</span>
+     </div>` +
+    sorted.map(r=>`<div class="rm-item" title="${esc(rmStatusLabel[r.status]||r.status)}">
+       <span class="rm-dot rm-${esc(r.status)}"></span>
+       <div class="rm-main">
+         ${r.category?`<div class="rm-cat">${esc(r.category)}</div>`:""}
+         <div class="rm-name">${esc(r.name)}</div>
+         ${r.note?`<div class="rm-note">${esc(r.note)}</div>`:""}
+       </div></div>`).join("") +
+    `<a class="rm-manage" href="admin.html">✎ Edit roadmap in Manage Data</a>`;
+}
+
+// ── crop filter options ──────────────────────────────
+function syncCropFilter(){
+  const sel = document.getElementById("filter-crop");
+  const names = [...new Set(DATA.crops.map(c=>c.name))].sort();
+  const cur = sel.value;
+  if (sel.options.length-1 !== names.length || names.some((n,i)=>sel.options[i+1]?.value!==n)){
+    sel.innerHTML = `<option value="">All crops</option>` + names.map(n=>`<option value="${esc(n)}">${esc(n)}</option>`).join("");
+    sel.value = names.includes(cur) ? cur : "";
+  }
+}
+
+// ── skeleton build (only when layout changes) ────────
+function layoutSignature(){
+  return JSON.stringify(visibleWidgets().map(w=>[w.id,w.minimized,w.type,w.span,w.position])) + "|" + activeCat;
+}
+function rebuild(){
+  const dash = document.getElementById("dashboard");
+  Object.values(charts).forEach(ch=>ch.destroy());
+  for (const k in charts) delete charts[k];
+  const ws = visibleWidgets();
+  const active = ws.filter(w=>!w.minimized);
+  renderTray(ws.filter(w=>w.minimized));
+
+  dash.innerHTML = active.map(w=>{
+    const span = (w.config && w.config.span) ? `span-${w.config.span}` : "";
+    const col = catColor(w.category);
+    let bodyHtml = "";
+    if (["line","bar","doughnut","gauge","climate"].includes(w.type)){
+      const boxH = w.type==="gauge" ? 180 : (w.config.span>=2 ? 200 : 170);
+      bodyHtml = w.type==="gauge"
+        ? `<div class="chart-box" style="height:${boxH}px"><canvas id="chart-${w.id}"></canvas></div><div style="text-align:center;font-size:12px;color:var(--muted)" id="gauge-cap-${w.id}"></div>`
+        : `<div class="chart-box" style="height:${boxH}px"><canvas id="chart-${w.id}"></canvas></div>`;
+    } else {
+      bodyHtml = `<div id="body-${w.id}"></div>`;
+    }
+    return `<div class="widget ${span}" data-id="${w.id}" data-cat="${esc(w.category)}"
+        style="border-top:3px solid ${col};background:${col}14">
+      <div class="widget-head">
+        <span class="widget-title" style="color:${col}">${esc(w.title)}</span>
+        <div class="widget-actions">
+          <button title="Minimize" onclick="toggleMin(${w.id},1)">▁</button>
+          <button title="Maximize" onclick="openMax(${w.id})">⤢</button>
+        </div>
+      </div>
+      <div class="widget-body">${bodyHtml}</div>
+    </div>`;
+  }).join("") || `<div style="color:var(--muted);padding:40px">No active widgets here — restore one from the tray above, use <strong>＋ Add Widget</strong>, or pick another category.</div>`;
+
+  active.forEach(w=>{ if (["line","bar","doughnut","gauge","climate"].includes(w.type)) makeChart(w); });
+  attachDnD();
+  layoutSig = layoutSignature();
+  updateAll();
+}
+
+// ── masonry: pack each widget into the shortest column(s) ────────────────────
+function masonryCols(width){ return width>1100 ? 4 : width>720 ? 2 : 1; }
+function layoutMasonry(){
+  const dash = document.getElementById("dashboard");
+  if (!dash) return;
+  const cards = [...dash.querySelectorAll(".widget")];
+  if (!cards.length){ dash.style.height=""; return; }
+  const gap = 16, total = dash.clientWidth;
+  const cols = masonryCols(total);
+  const colW = (total - gap*(cols-1)) / cols;
+  const heights = new Array(cols).fill(0);
+  cards.forEach(card=>{
+    let span = card.classList.contains("span-4") ? 4 : card.classList.contains("span-3") ? 3
+             : card.classList.contains("span-2") ? 2 : 1;
+    span = Math.min(span, cols);
+    let best = 0, bestH = Infinity;            // window of `span` adjacent cols with the lowest top
+    for (let i=0; i+span<=cols; i++){
+      const h = Math.max(...heights.slice(i, i+span));
+      if (h < bestH - 0.5){ bestH = h; best = i; }
+    }
+    card.style.width = (colW*span + gap*(span-1)) + "px";
+    card.style.left  = (best*(colW+gap)) + "px";
+    card.style.top   = bestH + "px";
+    const ch = card.offsetHeight;
+    for (let i=best; i<best+span; i++) heights[i] = bestH + ch + gap;
+  });
+  dash.style.height = Math.max(...heights) + "px";
+  if (!dash.classList.contains("ready")) requestAnimationFrame(()=>dash.classList.add("ready"));
+}
+let _resizeTimer;
+window.addEventListener("resize", ()=>{ clearTimeout(_resizeTimer); _resizeTimer=setTimeout(layoutMasonry, 120); });
+
+function renderTray(mins){
+  const tray = document.getElementById("min-tray");
+  if (!mins.length){ tray.style.display="none"; tray.innerHTML=""; return; }
+  tray.style.display="flex";
+  tray.innerHTML = `<span class="tray-label">▾ Minimized (${mins.length}) — click to restore</span>` +
+    mins.map(w=>`<span class="min-chip" style="border-left-color:${catColor(w.category)}">
+      <span onclick="toggleMin(${w.id},0)" title="Restore to dashboard">${esc(w.title)}</span></span>`).join("");
+}
+
+// ── drag-and-drop reordering ─────────────────────────
+let dragId = null;
+function attachDnD(){
+  document.querySelectorAll("#dashboard .widget").forEach(el=>{
+    el.setAttribute("draggable","true");
+    el.addEventListener("dragstart", e=>{
+      if (e.target.closest("button")){ e.preventDefault(); return; }
+      dragId = Number(el.dataset.id); el.classList.add("dragging");
+      e.dataTransfer.effectAllowed = "move";
+    });
+    el.addEventListener("dragend", ()=>{ dragId=null; el.classList.remove("dragging");
+      document.querySelectorAll(".drag-over").forEach(x=>x.classList.remove("drag-over")); });
+    el.addEventListener("dragover", e=>{ e.preventDefault();
+      if (Number(el.dataset.id)!==dragId) el.classList.add("drag-over"); });
+    el.addEventListener("dragleave", ()=> el.classList.remove("drag-over"));
+    el.addEventListener("drop", e=>{ e.preventDefault(); el.classList.remove("drag-over");
+      reorder(dragId, Number(el.dataset.id)); });
+  });
+}
+function reorder(from, target){
+  if (from==null || from===target) return;
+  const vis = visibleWidgets().filter(w=>!w.minimized).map(w=>w.id);
+  const fi = vis.indexOf(from), ti = vis.indexOf(target);
+  if (fi<0 || ti<0) return;
+  vis.splice(ti, 0, vis.splice(fi,1)[0]);          // new order of the visible subset
+  const visSet = new Set(vis);
+  const global = DATA.widgets.slice().sort((a,b)=>a.position-b.position || a.id-b.id);
+  let k=0;
+  const finalIds = global.map(w => visSet.has(w.id) ? vis[k++] : w.id);  // keep others in place
+  const pos = {}; finalIds.forEach((id,i)=> pos[id]=i);
+  const changed = [];
+  DATA.widgets.forEach(w=>{ if (w.position!==pos[w.id]){ w.position=pos[w.id]; changed.push(w); }});
+  rebuild();
+  changed.forEach(w=> api("PUT", `/api/data/widgets/${w.id}`, {position:w.position}).catch(()=>{}));
+}
+
+// ── chart factory ────────────────────────────────────
+function makeChart(w){
+  const cv = document.getElementById("chart-"+w.id);
+  if (!cv) return;
+  const base = { responsive:true, maintainAspectRatio:false,
+    plugins:{ legend:{ position:w.type==="doughnut"?"right":"top", labels:{font:{size:11}} } } };
+  let cfg;
+  if (w.type==="line") cfg={ type:"line", data:{labels:MONTHS,datasets:[]},
+    options:{...base, scales:{x:{grid:{display:false}},y:{grid:{color:"#e8efe9"}}}}};
+  else if (w.type==="bar") cfg={ type:"bar", data:{labels:[],datasets:[]},
+    options:{...base, indexAxis:w.config.horizontal?"y":"x",
+      scales:{x:{grid:{color:"#e8efe9"},ticks:{font:{size:11}}},y:{grid:{display:false},ticks:{font:{size:11}}}}}};
+  else if (w.type==="doughnut") cfg={ type:"doughnut", data:{labels:[],datasets:[{data:[],backgroundColor:PALETTE,borderColor:"#fff",borderWidth:3}]},
+    options:{...base, cutout:"55%"}};
+  else if (w.type==="gauge") cfg={ type:"doughnut",
+    data:{datasets:[{data:[0,100],backgroundColor:[C.blue,"#e8f4fd"],borderWidth:0,circumference:270,rotation:-135}]},
+    options:{cutout:"72%",responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{enabled:false}}},
+    plugins:[gaugeText(w)] };
+  else if (w.type==="climate") cfg={ type:"bar", data:{labels:MONTHS,datasets:[]},
+    options:{...base, scales:{
+      x:{grid:{display:false}},
+      yH:{position:"left", title:{display:true,text:"Harvest (lbs)",font:{size:10}}, grid:{color:"#e8efe9"}, beginAtZero:true},
+      yR:{position:"right", title:{display:true,text:"Rainfall (in)",font:{size:10}}, grid:{display:false}, beginAtZero:true},
+    }}};
+  charts[w.id] = new Chart(cv, cfg);
+}
+function gaugeText(w){
+  return { id:"gt-"+w.id, afterDraw(chart){
+    const {ctx,chartArea:{top,bottom,left,right}} = chart;
+    const cx=(left+right)/2, cy=(top+bottom)/2+18;
+    ctx.save(); ctx.font="bold 22px Segoe UI"; ctx.fillStyle=C.blue; ctx.textAlign="center";
+    ctx.fillText(Math.round(chart.data.datasets[0].data[0])+(w.config.unit&&w.config.unit.includes("%")?"%":""), cx, cy);
+    ctx.restore();
+  }};
+}
+
+// ── data update (every poll, no DOM rebuild) ─────────
+function updateAll(){
+  visibleWidgets().forEach(w=>{ if(!w.minimized) updateWidget(w); });
+  layoutMasonry();
+}
+function updateWidget(w){
+  switch(w.type){
+    case "kpi": return updateKpi(w);
+    case "line": return updateLine(w);
+    case "bar": return updateBar(w);
+    case "doughnut": return updateDoughnut(w);
+    case "gauge": return updateGauge(w);
+    case "climate": return updateClimate(w);
+    case "table": return setBody(w, tableHtml(w));
+    case "map": return setBody(w, mapHtml(w));
+    case "timeline": return setBody(w, timelineHtml());
+    case "progress": return setBody(w, progressHtml(w));
+    case "list": return setBody(w, listHtml(w));
+    case "library": return setBody(w, libraryHtml(w));
+  }
+}
+function setBody(w, html){ const el=document.getElementById("body-"+w.id); if(el) el.innerHTML=html; }
+
+function updateKpi(w){
+  const el = document.getElementById("body-"+w.id); if(!el) return;
+  const v = scalar(w.source);
+  const isMoney = w.config.money;
+  const val = isMoney ? money(v) : fmt(v) + (w.config.unit&&!w.config.unit.includes("%")?` <span style="font-size:15px;font-weight:400">${esc(w.config.unit)}</span>`:(w.config.unit==="%"?"%":""));
+  let sub = w.config.sub || "";
+  if (sub.startsWith("kpi:")) sub = DATA.kpis[sub.slice(4)] || "";
+  el.innerHTML = `<div class="kpi-value">${val}</div><div class="kpi-sub">${esc(sub)}</div>`;
+}
+function updateLine(w){
+  const ch=charts[w.id]; if(!ch) return;
+  if (w.source!=="crop_yield" && w.config.x){          // generic single-series line (e.g. harvest trend)
+    const rows = applyCfg(tableData(w.source), w.config);
+    ch.data.labels = rows.map(r=>r[w.config.x]);
+    const u = w.config.unit ? ` (${w.config.unit})` : "";
+    ch.data.datasets = [{ label:cap(w.config.y)+u, data:rows.map(r=>Number(r[w.config.y])),
+      borderColor:C.greenMid, backgroundColor:"rgba(46,125,70,.08)", tension:.4, fill:true, pointRadius:3 }];
+    return ch.update("none");
+  }
+  let series = DATA.crop_yield.series;
+  if (filters.crop) series = { [filters.crop]: series[filters.crop]||Array(12).fill(0) };
+  const crops = Object.keys(series);
+  ch.data.labels = DATA.crop_yield.labels;
+  ch.data.datasets = crops.map((c,i)=>({ label:c, data:series[c],
+    borderColor:PALETTE[i%PALETTE.length], backgroundColor:"rgba(46,125,70,.05)", tension:.4, fill:true, pointRadius:2 }));
+  ch.update("none");
+}
+function barUnit(w, rows, col){
+  if (!col) return "";
+  if (w.config.unit) return w.config.unit;        // explicit per-widget unit (editable on the backend)
+  if (w.config.money) return "$";
+  if (rows[0] && "unit" in rows[0] && (col==="value"||col==="threshold")) return rows[0].unit || "";
+  return UNITS[col] || "";
+}
+function lbl(w, rows, col){ const u=barUnit(w,rows,col); return cap(col)+(u?` (${u})`:""); }
+function updateBar(w){
+  const ch=charts[w.id]; if(!ch) return;
+  const rows = applyCfg(tableData(w.source), w.config);
+  ch.data.labels = rows.map(r=>r[w.config.label]);
+  const ds = [{ label:lbl(w,rows,w.config.value), data:rows.map(r=>Number(r[w.config.value])), backgroundColor:C.greenMid, borderRadius:4 }];
+  if (w.config.compare) ds.push({ label:lbl(w,rows,w.config.compare), data:rows.map(r=>Number(r[w.config.compare])), backgroundColor:C.greenPale, borderRadius:4 });
+  ch.data.datasets = ds; ch.update("none");
+}
+function updateDoughnut(w){
+  const ch=charts[w.id]; if(!ch) return;
+  const rows = applyCfg(tableData(w.source), w.config).filter(r=>Number(r[w.config.value])>0);
+  const u = w.config.unit ? " "+w.config.unit : "";
+  ch.data.labels = rows.map(r=>`${r[w.config.label]} (${fmt(r[w.config.value])}${u})`);
+  ch.data.datasets[0].data = rows.map(r=>Number(r[w.config.value]));
+  ch.update("none");
+}
+function updateGauge(w){
+  const ch=charts[w.id]; if(!ch) return;
+  const v = Math.max(0, Math.min(w.config.max||100, scalar(w.source)));
+  ch.data.datasets[0].data = [v, (w.config.max||100)-v]; ch.update("none");
+  const cap=document.getElementById("gauge-cap-"+w.id);
+  if(cap) cap.textContent = `${fmt(v)} ${w.config.unit||""}${w.config.target?` · Target: ${w.config.target}`:""}`;
+}
+// Climate combo: Miami rainfall (bars) overlaid on total monthly harvest (line)
+function updateClimate(w){
+  const ch=charts[w.id]; if(!ch) return;
+  const wx = DATA.weather || [];
+  const rain = MONTHS.map((_,i)=>{ const r=wx.find(x=>Number(x.month)===i+1); return r?Number(r.rainfall_in):0; });
+  const series = (DATA.crop_yield && DATA.crop_yield.series) || {};
+  const harvest = MONTHS.map((_,i)=> Object.values(series).reduce((s,arr)=> s+(Number(arr[i])||0), 0));
+  ch.data.labels = MONTHS;
+  ch.data.datasets = [
+    { type:"bar",  label:"Rainfall (in)", yAxisID:"yR", data:rain,
+      backgroundColor:"rgba(91,122,153,.45)", borderColor:"#5b7a99", borderWidth:1, borderRadius:4, order:2 },
+    { type:"line", label:"Harvest (lbs)", yAxisID:"yH", data:harvest,
+      borderColor:C.greenMid, backgroundColor:"rgba(46,125,70,.08)", tension:.4, fill:true, pointRadius:2, order:1 },
+  ];
+  ch.update("none");
+}
+const cap = s => String(s).replace(/_/g," ").replace(/\b\w/g,m=>m.toUpperCase());
+
+// ── DOM-widget renderers ─────────────────────────────
+function cropMargin(c){ return (Number(c.price)-Number(c.cost)); }
+function soilSafety(r){
+  const v=Number(r.value), t=Number(r.threshold);
+  if (!t) return {cls:"pending", txt:"—"};
+  const ratio=v/t;
+  if (ratio>=1)  return {cls:"delayed",  txt:"Over limit"};
+  if (ratio>=0.5)return {cls:"at-risk",  txt:"Elevated"};
+  return {cls:"on-track", txt:"Safe"};
+}
+function tableHtml(w){
+  const cols = w.config.columns || Object.keys((tableData(w.source)[0]||{}));
+  const rows = applyCfg(tableData(w.source), w.config);
+  const head = cols.map(c=>`<th>${esc(cap(c))}</th>`).join("");
+  const body = rows.map(r=>`<tr>${cols.map(c=>{
+    if (c==="status") return `<td><span class="status-pill pill-${r.status}">${statusLabel[r.status]||r.status}</span></td>`;
+    if (c==="safety"){ const s=soilSafety(r); return `<td><span class="status-pill pill-${s.cls}">${s.txt}</span></td>`; }
+    if (c==="margin") { const m=cropMargin(r); return `<td style="color:${m>=0?'var(--green-mid)':'var(--red)'}">${money(m)}/lb</td>`; }
+    if (c==="yield_lbs") return `<td>${r[c]>0?fmt(r[c])+" lbs":"—"}</td>`;
+    if (c==="harvested") return `<td>${r[c]>0?fmt(r[c])+" units":"—"}</td>`;
+    if (c==="germ") return `<td>${fmt(r[c])}%</td>`;
+    if (c==="value") return `<td>${fmt(r.value)}${r.unit?(" "+r.unit):""}</td>`;
+    if (c==="threshold") return `<td>${r[c]>0?fmt(r[c])+(r.unit?(" "+r.unit):""):"n/a"}</td>`;
+    if (c==="name"||c==="crop") return `<td><strong>${esc(r[c])}</strong></td>`;
+    if (typeof r[c]==="number"){ const u=UNITS[c]; return `<td>${fmt(r[c])}${u?(" "+u):""}</td>`; }
+    return `<td>${esc(r[c])}</td>`;
+  }).join("")}</tr>`).join("");
+  return `<table class="data-table"><thead><tr>${head}</tr></thead><tbody>${body||`<tr><td colspan="${cols.length}" style="color:var(--muted)">No rows match filters</td></tr>`}</tbody></table>`;
+}
+function mapHtml(w){
+  const pins = bedsFiltered().map(b=>`<div class="pin pin-${b.status}" data-label="${esc(b.name)} — ${esc(cropName(b.crop_id))}" style="top:${b.y_pct}%;left:${b.x_pct}%"></div>`).join("");
+  return `<div class="map-placeholder">${pins}
+    <div class="map-legend"><span>🟢 On Track</span><span>🟡 At Risk</span><span>🔴 Delayed</span><span>🔵 Complete</span></div></div>`;
+}
+function timelineHtml(){
+  return DATA.milestones.map(m=>`<div class="tl-item"><div class="tl-dot ${m.state}"></div>
+    <div class="tl-body"><h4>${esc(m.label)}</h4><p>${esc(m.date)} · ${statusLabel[m.state]||m.state}</p></div></div>`).join("");
+}
+function progressHtml(w){
+  const rows = tableData(w.source);
+  return rows.map((r,i)=>{
+    const val=Number(r[w.config.value]), goal=Number(r[w.config.goal])||1;
+    const pct=Math.round(val/goal*100);
+    const disp = w.config.money ? `${money(val)} / ${money(goal)}` : `${fmt(val)} / ${fmt(goal)}`;
+    return `<div class="progress-row"><div class="progress-label"><span>${esc(r[w.config.label])}</span><span>${pct}%</span></div>
+      <div class="progress-bar"><div class="progress-fill" style="width:${Math.min(pct,100)}%;background:${PALETTE[i%PALETTE.length]}"></div></div>
+      <div style="font-size:11px;color:var(--muted)">${disp}</div></div>`;
+  }).join("");
+}
+function listHtml(w){
+  const rows = tableData(w.source);
+  if (w.source==="tasks") return rows.map(t=>`<div class="list-item">
+      <span class="li-tag">${esc(t.type)}</span>
+      <div class="li-main"><h4>${esc(t.title)}</h4><p>${esc(t.assignee||"")} · due ${esc(t.due||"—")}${t.notes?` · ${esc(t.notes)}`:""}</p></div>
+      <span class="status-pill pill-${t.status}">${statusLabel[t.status]||t.status}</span></div>`).join("");
+  if (w.source==="partners") return rows.map(p=>`<div class="list-item">
+      <span class="li-tag">${esc(p.type)}</span>
+      <div class="li-main"><h4>${esc(p.name)}</h4><p>${esc(p.contribution||"")}${p.notes?` · ${esc(p.notes)}`:""}</p></div></div>`).join("");
+  if (w.source==="weather_alerts"){
+    const icon={hurricane:"🌀",flood:"🌊",drought:"🌵",heat:"🔥",frost:"❄️",wind:"💨",storm:"⛈️"};
+    const sev={warning:"pill-delayed",watch:"pill-at-risk",advisory:"pill-pending",info:"pill-complete"};
+    const sorted = rows.slice().sort((a,b)=>(Number(b.active)-Number(a.active)));
+    return sorted.map(a=>{
+      const calm = String(a.title).toLowerCase().startsWith("no active");
+      const ic = calm ? "🌤️" : (icon[a.type]||"⚠️");
+      const tag = calm ? "all clear" : a.type;
+      return `<div class="list-item" style="${Number(a.active)?'':'opacity:.6'}">
+        <span class="li-tag">${ic} ${esc(tag)}</span>
+        <div class="li-main"><h4>${esc(a.title)}${Number(a.active)?' <span class="alert-live">● active</span>':''}</h4>
+          <p>${esc(a.date||"")}${a.note?` · ${esc(a.note)}`:""}</p></div>
+        ${calm?'':`<span class="status-pill ${sev[a.severity]||'pill-pending'}">${esc(a.severity)}</span>`}</div>`;
+    }).join("")
+      || `<div class="list-item"><div class="li-main"><p style="color:var(--muted)">No weather alerts.</p></div></div>`;
+  }
+  return rows.map(r=>`<div class="list-item"><div class="li-main"><h4>${esc(r[Object.keys(r)[1]]||"")}</h4></div></div>`).join("");
+}
+function libraryHtml(w){
+  return `<div class="lib-grid">` + cropsFiltered().map(c=>`
+    <div class="lib-card" onclick="openCropDetail(${JSON.stringify(c.id)}, ${w.id})">
+      <div class="lib-type">${esc(c.type)}</div>
+      <h4>${esc(c.name)}</h4>
+      <p>${esc((c.nutrition||"").slice(0,80))}${(c.nutrition||"").length>80?"…":""}</p>
+    </div>`).join("") + `</div>`;
+}
+
+// ── minimize / delete / add ──────────────────────────
+async function toggleMin(id, val){
+  try { await api("PUT", `/api/data/widgets/${id}`, {minimized:val});
+    const w=DATA.widgets.find(x=>x.id===id); if(w) w.minimized=val; renderNav(); rebuild();
+  } catch(e){ toast(e.message,true); }
+}
+async function delWidget(id){
+  const w=DATA.widgets.find(x=>x.id===id);
+  if (!confirm(`Remove widget "${w?w.title:id}" from the dashboard?`)) return;
+  try { await api("DELETE", `/api/data/widgets/${id}`);
+    DATA.widgets = DATA.widgets.filter(x=>x.id!==id); toast("Widget removed"); renderNav(); rebuild();
+  } catch(e){ toast(e.message,true); }
+}
+async function openCatalog(){
+  if (!catalog.length) catalog = await api("GET","/api/widget-catalog");
+  document.getElementById("cat-grid").innerHTML = catalog.map((t,i)=>`
+    <div class="cat-card"><div class="cat-meta">${esc(t.category)} · ${esc(t.type)}</div>
+      <h4>${esc(t.title)}</h4>
+      <button onclick="addWidget(${i})">＋ Add to dashboard</button></div>`).join("");
+  document.getElementById("cat-overlay").classList.add("open");
+}
+function closeCatalog(){ document.getElementById("cat-overlay").classList.remove("open"); }
+async function addWidget(i){
+  const t = catalog[i];
+  const pos = Math.max(0,...DATA.widgets.map(w=>w.position))+1;
+  try {
+    const res = await api("POST","/api/data/widgets",{
+      title:t.title, type:t.type, category:t.category, source:t.source,
+      config:JSON.stringify(t.config||{}), position:pos, minimized:0 });
+    DATA.widgets.push({...t, id:res.id, config:t.config||{}, position:pos, minimized:0});
+    toast(`Added "${t.title}"`); closeCatalog(); renderNav(); rebuild();
+  } catch(e){ toast(e.message,true); }
+}
+
+// ── maximize ─────────────────────────────────────────
+let maxChart=null, cropChart=null;
+function openMax(id){
+  const w = DATA.widgets.find(x=>x.id===id); if(!w) return;
+  document.getElementById("max-title").textContent = w.title;
+  const body = document.getElementById("max-body");
+  const wantsCrop = w.config.maximize && w.config.maximize.detail==="crop";
+  if (wantsCrop){
+    const opts = cropsFiltered().map(c=>`<option value="${esc(c.id)}">${esc(c.name)}</option>`).join("");
+    body.innerHTML = `<div style="display:flex;align-items:center;gap:12px;margin-bottom:6px">
+        <span style="font-size:12px;color:var(--muted)">Select crop:</span>
+        <select class="crop-select" id="crop-pick" onchange="renderCropDetail('${id}')">${opts}</select></div>
+      <div id="crop-detail"></div>`;
+    document.getElementById("max-overlay").classList.add("open");
+    renderCropDetail(id);
+  } else {
+    renderGenericMax(w);
+    document.getElementById("max-overlay").classList.add("open");
+  }
+}
+function openCropDetail(cropId, widgetId){
+  openMax(widgetId);
+  const pick=document.getElementById("crop-pick"); if(pick){ pick.value=cropId; renderCropDetail(widgetId); }
+}
+function renderCropDetail(widgetId){
+  const w = DATA.widgets.find(x=>x.id==widgetId);
+  const cid = document.getElementById("crop-pick").value;
+  const c = DATA.crops.find(x=>x.id===cid); if(!c) return;
+  const panels = (w.config.maximize && w.config.maximize.panels) || ["yield_chart","nutrition","culture","herbal","economics"];
+  const series = DATA.crop_yield.series[c.name] || Array(12).fill(0);
+  const revenue = Number(c.yield_lbs)*Number(c.price);
+  const blocks = [];
+  if (panels.includes("yield_chart"))
+    blocks.push(`<div class="panel full"><h4>Yield Over Time (lbs / month)</h4><canvas id="crop-chart" height="90"></canvas></div>`);
+  if (panels.includes("nutrition")) blocks.push(`<div class="panel"><h4>Nutritional Value</h4><p>${esc(c.nutrition||"—")}</p></div>`);
+  if (panels.includes("culture"))   blocks.push(`<div class="panel"><h4>Cultural Value</h4><p>${esc(c.culture||"—")}</p></div>`);
+  if (panels.includes("herbal"))    blocks.push(`<div class="panel"><h4>Herbal / Medicinal Use</h4><p>${esc(c.herbal||"—")}</p></div>`);
+  if (panels.includes("economics")) blocks.push(`<div class="panel full"><h4>Economics</h4><div class="econ-grid">
+      <div class="econ-cell"><div class="v">${fmt(c.yield_lbs)}</div><div class="l">lbs harvested</div></div>
+      <div class="econ-cell"><div class="v">${money(c.cost)}</div><div class="l">cost / lb</div></div>
+      <div class="econ-cell"><div class="v">${money(c.price)}</div><div class="l">price / lb</div></div>
+      <div class="econ-cell"><div class="v">${money(revenue)}</div><div class="l">est. revenue</div></div></div></div>`);
+  document.getElementById("crop-detail").innerHTML =
+    `<h3 style="color:var(--green-dark);margin:6px 0 2px">${esc(c.name)} <span style="font-weight:400;color:var(--muted);font-size:13px">· ${esc(c.type)} · ${c.beds} beds · ${statusLabel[c.status]||c.status}</span></h3>
+     <div class="detail-panels">${blocks.join("")}</div>`;
+  if (cropChart){ cropChart.destroy(); cropChart=null; }
+  const cv = document.getElementById("crop-chart");
+  if (cv) cropChart = new Chart(cv, { type:"line",
+    data:{ labels:MONTHS, datasets:[{ label:`${c.name} (lbs)`, data:series, borderColor:C.greenMid, backgroundColor:"rgba(46,125,70,.08)", tension:.4, fill:true, pointRadius:3 }]},
+    options:{ responsive:true, plugins:{legend:{display:false}}, scales:{y:{grid:{color:"#e8efe9"}},x:{grid:{display:false}}} }});
+}
+function renderGenericMax(w){
+  const body = document.getElementById("max-body");
+  if (["line","bar","doughnut","gauge","climate"].includes(w.type)){
+    body.innerHTML = `<canvas id="max-chart" height="${w.type==="doughnut"||w.type==="gauge"?"220":"140"}"></canvas>`;
+    if (maxChart){ maxChart.destroy(); maxChart=null; }
+    // clone the live chart's config by re-running its updater against a temp widget
+    const tmp = {...w, id:"__max"};
+    charts["__max"] = null;
+    makeChartInto(tmp, "max-chart");
+    maxChart = charts["__max"]; delete charts["__max"];
+    // fill data
+    const real = charts[w.id];
+    if (real && maxChart){ maxChart.data = JSON.parse(JSON.stringify(real.data)); maxChart.update(); }
+  } else {
+    let html="";
+    if (w.type==="table") html=tableHtml(w);
+    else if (w.type==="map") html=mapHtml(w);
+    else if (w.type==="timeline") html=timelineHtml();
+    else if (w.type==="progress") html=progressHtml(w);
+    else if (w.type==="list") html=listHtml(w);
+    else if (w.type==="library") html=libraryHtml(w);
+    body.innerHTML = `<div style="font-size:14px">${html}</div>`;
+  }
+}
+function makeChartInto(w, canvasId){
+  const cv=document.getElementById(canvasId); if(!cv) return;
+  const saveId=w.id; const realMake=makeChart;
+  // temporarily map id->canvas by giving canvas the expected id
+  cv.id = "chart-"+w.id; realMake(w); cv.id=canvasId;
+}
+function closeMax(){ document.getElementById("max-overlay").classList.remove("open");
+  if(maxChart){maxChart.destroy();maxChart=null;} if(cropChart){cropChart.destroy();cropChart=null;} }
+
+// ── poll ─────────────────────────────────────────────
+const badge = document.getElementById("live-badge");
+let lastPayload="";
+async function refresh(force=false){
+  try {
+    const res = await fetch("/api/dashboard");
+    if(!res.ok) throw new Error(res.status);
+    const text = await res.text();
+    badge.textContent="⟳ Live"; badge.classList.remove("offline");
+    if(text!==lastPayload || force){
+      lastPayload=text; DATA=JSON.parse(text);
+      syncCropFilter(); renderNav(); renderRoadmap();
+      if (layoutSignature()!==layoutSig) rebuild(); else updateAll();
+      document.getElementById("last-sync").textContent = new Date().toLocaleString("en-US",{dateStyle:"medium",timeStyle:"short"});
+    }
+  } catch(e){ badge.textContent="⚠ API offline"; badge.classList.add("offline"); }
+}
+
+document.getElementById("filter-crop").addEventListener("change", e=>{ filters.crop=e.target.value; updateAll(); rebuild(); });
+document.getElementById("filter-status").addEventListener("change", e=>{ filters.status=e.target.value; updateAll(); rebuild(); });
+document.querySelectorAll(".overlay").forEach(o=>o.addEventListener("click",e=>{ if(e.target===o){ closeMax(); closeCatalog(); }}));
+
+refresh(true);
+setInterval(refresh, 4000);
+
+// ── Cerasee AI assistant ─────────────────────────────
+let cerOpen=false, cerReady=false, cerConfigured=false, cerBusy=false;
+const cerSuggestions = [
+  "How are my crops doing?",
+  "Is the soil safe for planting?",
+  "What's my top crop since 2023?",
+  "How's the grant budget looking?",
+];
+function toggleCerasee(){
+  cerOpen=!cerOpen;
+  document.getElementById("cerasee-panel").classList.toggle("open", cerOpen);
+  document.getElementById("cerasee-fab").style.display = cerOpen ? "none" : "flex";
+  if (cerOpen && !cerReady) cerInit();
+}
+async function cerInit(){
+  cerReady=true;
+  let status={configured:false};
+  try { status = await api("GET","/api/ai/status"); } catch(e){}
+  cerConfigured = !!status.configured;
+  if (cerConfigured){ cerShowGreeting(); cerShowInput(); }
+  else { cerShowSetup(); }
+}
+function cerBodyEl(){ return document.getElementById("cer-body"); }
+function cerAdd(text, cls){
+  const el=document.createElement("div"); el.className="cer-msg "+cls; el.textContent=text;
+  cerBodyEl().appendChild(el); cerBodyEl().scrollTop=cerBodyEl().scrollHeight; return el;
+}
+function cerShowGreeting(){
+  cerBodyEl().innerHTML =
+    `<div class="cer-greet">🌿 Hi! I'm <strong>Cerasee</strong>. Ask me anything about the farm's crops, soil, harvests, budget, or community impact.
+     <div class="cer-chips">${cerSuggestions.map(s=>`<span class="cer-chip" onclick="cerQuick(this)">${esc(s)}</span>`).join("")}</div></div>`;
+}
+function cerShowInput(){
+  document.getElementById("cer-foot").innerHTML =
+    `<div class="cer-inputrow">
+       <input id="cer-q" placeholder="Ask Cerasee…" onkeydown="if(event.key==='Enter')cerAsk()">
+       <button class="cer-send" onclick="cerAsk()" title="Send">➤</button>
+     </div>`;
+  setTimeout(()=>{ const q=document.getElementById("cer-q"); if(q) q.focus(); },50);
+}
+function cerShowSetup(prefill){
+  cerBodyEl().innerHTML = `<div class="cer-greet">🌿 Meet <strong>Cerasee</strong>, your farm-data assistant.</div>`;
+  document.getElementById("cer-foot").innerHTML =
+    `<div class="cer-setup">
+       <p>${prefill||"To ask Cerasee anything, add your Anthropic API key. It's stored on the backend and never shown on the dashboard."}</p>
+       <input id="cer-key" type="password" placeholder="sk-ant-…" onkeydown="if(event.key==='Enter')cerSaveKey()">
+       <button onclick="cerSaveKey()">Save key &amp; start chatting</button>
+       <p style="font-size:11px">Get a key at <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">console.anthropic.com</a> · you can also set it under <a href="admin.html">Manage Data → Cerasee</a>.</p>
+     </div>`;
+  setTimeout(()=>{ const k=document.getElementById("cer-key"); if(k) k.focus(); },50);
+}
+async function cerSaveKey(){
+  const key=(document.getElementById("cer-key").value||"").trim();
+  if(!key) return toast("Enter your API key",true);
+  try {
+    await api("PUT","/api/ai/config",{api_key:key});
+    cerConfigured=true; cerShowGreeting(); cerShowInput();
+    toast("Cerasee is ready 🌿");
+  } catch(e){ toast(e.message,true); }
+}
+function cerQuick(el){ const q=document.getElementById("cer-q"); if(q){ q.value=el.textContent; cerAsk(); } }
+async function cerAsk(){
+  if(cerBusy) return;
+  const input=document.getElementById("cer-q"); if(!input) return;
+  const question=input.value.trim(); if(!question) return;
+  input.value="";
+  // clear the greeting block on first question
+  const greet=cerBodyEl().querySelector(".cer-greet"); if(greet) greet.remove();
+  cerAdd(question,"user");
+  cerBusy=true;
+  const typing=document.createElement("div"); typing.className="cer-typing"; typing.textContent="Cerasee is thinking…";
+  cerBodyEl().appendChild(typing); cerBodyEl().scrollTop=cerBodyEl().scrollHeight;
+  try {
+    const res=await fetch("/api/ai/ask",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({question})});
+    const data=await res.json().catch(()=>({}));
+    typing.remove();
+    if(res.status===400 && data.error==="no_api_key"){ cerConfigured=false; cerShowSetup(data.message); }
+    else if(!res.ok){ cerAdd(data.message || data.error || "Something went wrong.","bot err"); }
+    else { cerAdd(data.answer,"bot"); }
+  } catch(e){ typing.remove(); cerAdd("Couldn't reach the server. Is the backend running?","bot err"); }
+  cerBusy=false;
+  const q=document.getElementById("cer-q"); if(q) q.focus();
+}
+</script>
+</body>
+</html>
