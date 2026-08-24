@@ -38,6 +38,9 @@ from urllib.parse import urlparse, parse_qs, unquote
 from datetime import datetime, timezone, date, timedelta
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
+import pesticide_data  # farm chemical cards + cleaned application log + aggregates
+import livestock_data  # egg log, chicken purchases + sourcing (cleaned)
+
 BASE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE, "agrigrant.db")
 PORT = 7654
@@ -109,8 +112,15 @@ TABLES = {
     "tasks": {
         "pk": "id", "auto": True, "category": "Operations", "label": "Tasks & Deadlines",
         "cols": {
-            "id": int, "title": str, "assignee": str, "type": str,
-            "due": str, "status": str, "notes": str,
+            "id": int, "title": str, "assignee": str, "role": str, "type": str,
+            "priority": str, "start": str, "due": str, "status": str, "notes": str,
+        },
+    },
+    "people": {  # volunteers / interns / employees who can be assigned tasks
+        "pk": "id", "auto": True, "category": "Operations", "label": "People (Team)",
+        "cols": {
+            "id": int, "name": str, "role": str, "phone": str,
+            "email": str, "active": int, "notes": str,
         },
     },
     "budget": {
@@ -124,6 +134,50 @@ TABLES = {
     "inputs": {
         "pk": "name", "auto": False, "category": "Sustainability", "label": "Inputs & Compost",
         "cols": {"name": str, "applied": float, "benchmark": float},
+    },
+    "chemicals": {  # pesticide/biopesticide reference cards w/ health + env info
+        "pk": "id", "auto": False, "category": "Sustainability", "label": "Farm Inputs — Health & Safety",
+        "cols": {
+            "id": str, "name": str, "active": str, "ptype": str, "origin": str,
+            "omri": str, "targets": str, "applications": int, "caution": str,
+            "health": str, "environment": str, "pollinators": str, "aquatic": str,
+            "sources": "json",
+        },
+    },
+    "pesticide_log": {  # cleaned spray-log applications (2023–2026)
+        "pk": "id", "auto": True, "category": "Sustainability", "label": "Pesticide Applications",
+        "cols": {
+            "id": int, "date": str, "crop": str, "bed": str, "pest": str,
+            "scale": int, "product": str, "chemicals": str, "dosage": str, "notes": str,
+        },
+    },
+    "pest_pressure": {  # applications + avg severity by pest (aggregate)
+        "pk": "pest", "auto": False, "category": "Sustainability", "label": "Pest Pressure",
+        "cols": {"pest": str, "applications": int, "avg_scale": float},
+    },
+    "pesticide_annual": {  # applications per year (aggregate)
+        "pk": "year", "auto": False, "category": "Sustainability", "label": "Applications by Year",
+        "cols": {"year": str, "applications": int},
+    },
+    # ── Livestock — egg production + chicken program (from the 2026 logs) ──────
+    "eggs": {
+        "pk": "id", "auto": True, "category": "Livestock", "label": "Egg Log (daily)",
+        "cols": {"id": int, "date": str, "flock": str, "total": int,
+                 "brown": int, "other": int, "feed": str, "staff": str},
+    },
+    "eggs_monthly": {
+        "pk": "month", "auto": False, "category": "Livestock", "label": "Eggs by Month",
+        "cols": {"month": str, "label": str, "total": int,
+                 "brown": int, "other": int, "avg_per_day": float},
+    },
+    "livestock_costs": {
+        "pk": "id", "auto": True, "category": "Livestock", "label": "Chicken Purchases",
+        "cols": {"id": int, "date": str, "item": str, "cost": float,
+                 "store": str, "flock": str},
+    },
+    "chicken_sourcing": {
+        "pk": "id", "auto": True, "category": "Livestock", "label": "Chicken Inputs & Suppliers",
+        "cols": {"id": int, "product": str, "brand": str, "supplier": str, "notes": str},
     },
     "weather": {  # monthly Miami climate, to compare against harvest over the year
         "pk": "month", "auto": False, "category": "Weather", "label": "Miami Weather (monthly)",
@@ -204,9 +258,23 @@ def init_db():
     # Cerasee AI assistant config — kept OUT of the TABLES registry so the API
     # key is never exposed through the generic /api/data or /api/dashboard.
     c.execute("CREATE TABLE IF NOT EXISTS ai_settings (key TEXT PRIMARY KEY, value TEXT)")
+    migrate_columns(c)  # add any columns introduced after a DB was first created
     conn.commit()
     seed(conn)
     conn.close()
+
+
+def migrate_columns(c):
+    """Add columns that were introduced after an existing DB was created.
+    CREATE TABLE IF NOT EXISTS never alters an existing table, so new columns
+    in the registry (e.g. tasks.priority) are backfilled here — non-destructive."""
+    for name, spec in TABLES.items():
+        have = {r[1] for r in c.execute(f"PRAGMA table_info({name})")}
+        if not have:
+            continue  # table will be created fresh above
+        for col, t in spec["cols"].items():
+            if col not in have:
+                c.execute(f"ALTER TABLE {name} ADD COLUMN {col} {coldef(t)}")
 
 
 def seed(conn):
@@ -349,17 +417,30 @@ def seed(conn):
             ],
         )
 
+    if empty("people"):
+        c.executemany(
+            "INSERT INTO people (name,role,phone,email,active,notes) VALUES (?,?,?,?,?,?)",
+            [
+                ("Director", "employee", "", "", 1, "Executive Director — grants & partnerships"),
+                ("Farm Manager", "employee", "", "", 1, "Day-to-day growing operations"),
+                ("Volunteer Crew", "volunteer", "", "", 1, "Rotating weekend volunteers"),
+                ("Intern", "intern", "", "", 1, "Seasonal data & field intern"),
+            ],
+        )
+
     if empty("tasks"):
         c.executemany(
-            "INSERT INTO tasks (title,assignee,type,due,status,notes) VALUES (?,?,?,?,?,?)",
+            "INSERT INTO tasks (title,assignee,role,type,priority,start,due,status,notes) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
             [
-                ("Submit USDA mid-year grant report", "Director", "grant", "2026-06-30", "active", "Attach yield + impact data"),
-                ("Scout collard beds for aphids", "Volunteer Crew", "task", "2026-06-20", "active", "B2 flagged at-risk"),
-                ("Order drip-line fittings", "Farm Manager", "purchase", "2026-06-24", "pending", "Replace cracked Pepper Row line"),
-                ("Harvest & dry sorrel calyces", "Crew", "task", "2026-09-15", "pending", "For holiday sorrel demand"),
-                ("Renew Comb Cutters MOU", "Director", "todo", "2026-07-10", "pending", "On-site beekeeping partner"),
-                ("Plant fall collard succession", "Farm Manager", "task", "2026-08-01", "pending", "Beds B2, B8"),
-                ("Carbon-credit documentation packet", "Director", "grant", "2026-10-01", "pending", "Record-keeping for credits"),
+                ("Submit USDA mid-year grant report", "Director", "employee", "grant", "high", "2026-06-15", "2026-06-30", "active", "Attach yield + impact data"),
+                ("Scout collard beds for aphids", "Volunteer Crew", "volunteer", "task", "high", "2026-06-18", "2026-06-20", "active", "B2 flagged at-risk"),
+                ("Order drip-line fittings", "Farm Manager", "employee", "purchase", "medium", "2026-06-20", "2026-06-24", "pending", "Replace cracked Pepper Row line"),
+                ("Log weekly harvest weights", "Intern", "intern", "task", "medium", "2026-06-16", "2026-06-21", "active", "Enter into harvest log spreadsheet"),
+                ("Harvest & dry sorrel calyces", "Volunteer Crew", "volunteer", "task", "low", "2026-09-10", "2026-09-15", "pending", "For holiday sorrel demand"),
+                ("Renew Comb Cutters MOU", "Director", "employee", "todo", "medium", "2026-07-01", "2026-07-10", "pending", "On-site beekeeping partner"),
+                ("Plant fall collard succession", "Farm Manager", "employee", "task", "medium", "2026-07-25", "2026-08-01", "pending", "Beds B2, B8"),
+                ("Carbon-credit documentation packet", "Director", "employee", "grant", "high", "2026-09-15", "2026-10-01", "pending", "Record-keeping for credits"),
             ],
         )
 
@@ -399,6 +480,63 @@ def seed(conn):
                 ("Neem (oz)",             6,   8),
                 ("Mulch (cu ft)",        40,  45),
             ],
+        )
+
+    # ── Pesticide / biopesticide program — from the real spray log (2023–26) ──
+    #    Chemical health & environmental cards summarize EPA + NPIC primary
+    #    sources; the log + aggregates come from UGW.pesticide.application.log.
+    if empty("chemicals"):
+        c.executemany(
+            "INSERT INTO chemicals (id,name,active,ptype,origin,omri,targets,applications,"
+            "caution,health,environment,pollinators,aquatic,sources) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [(ch["id"], ch["name"], ch["active"], ch["ptype"], ch["origin"], ch["omri"],
+              ch["targets"], ch.get("applications", 0), ch["caution"], ch["health"],
+              ch["environment"], ch["pollinators"], ch["aquatic"], json.dumps(ch["sources"]))
+             for ch in pesticide_data.CHEMICALS],
+        )
+    if empty("pesticide_log"):
+        c.executemany(
+            "INSERT INTO pesticide_log (date,crop,bed,pest,scale,product,chemicals,dosage,notes) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            [(r["date"], r["crop"], r["bed"], r["pest"], r["scale"], r["product"],
+              r["chemicals"], r["dosage"], r["notes"]) for r in pesticide_data.PESTICIDE_LOG],
+        )
+    if empty("pest_pressure"):
+        c.executemany(
+            "INSERT INTO pest_pressure (pest,applications,avg_scale) VALUES (?,?,?)",
+            [(p["pest"], p["applications"], p["avg_scale"]) for p in pesticide_data.PEST_PRESSURE],
+        )
+    if empty("pesticide_annual"):
+        c.executemany(
+            "INSERT INTO pesticide_annual (year,applications) VALUES (?,?)",
+            [(a["year"], a["applications"]) for a in pesticide_data.PESTICIDE_ANNUAL],
+        )
+
+    # ── Livestock — egg production + chicken program (2026 logs) ──────────────
+    if empty("eggs"):
+        c.executemany(
+            "INSERT INTO eggs (date,flock,total,brown,other,feed,staff) VALUES (?,?,?,?,?,?,?)",
+            [(e["date"], e["flock"], e["total"], e["brown"], e["other"], e["feed"], e["staff"])
+             for e in livestock_data.EGGS],
+        )
+    if empty("eggs_monthly"):
+        c.executemany(
+            "INSERT INTO eggs_monthly (month,label,total,brown,other,avg_per_day) VALUES (?,?,?,?,?,?)",
+            [(m["month"], m["label"], m["total"], m["brown"], m["other"], m["avg_per_day"])
+             for m in livestock_data.EGGS_MONTHLY],
+        )
+    if empty("livestock_costs"):
+        c.executemany(
+            "INSERT INTO livestock_costs (date,item,cost,store,flock) VALUES (?,?,?,?,?)",
+            [(x["date"], x["item"], x["cost"], x["store"], x["flock"])
+             for x in livestock_data.LIVESTOCK_COSTS],
+        )
+    if empty("chicken_sourcing"):
+        c.executemany(
+            "INSERT INTO chicken_sourcing (product,brand,supplier,notes) VALUES (?,?,?,?)",
+            [(s["product"], s["brand"], s["where"], s["notes"])
+             for s in livestock_data.CHICKEN_SOURCING],
         )
 
     if empty("partners"):
@@ -648,6 +786,40 @@ def default_widgets():
          {"unit": "active", "sub": "kpi:alerts_sub"}, 29, 0),
         ("Weather Alerts", "list", "Weather", "weather_alerts", {"span": 2}, 30, 0),
         ("Miami Rainfall vs Harvest", "climate", "Weather", "weather", {"span": 2}, 31, 0),
+
+        # ── Pest & spray management (from the real pesticide log, 2023–26) ────
+        ("Pest Applications Logged", "kpi", "Sustainability", "kpi:pest_apps",
+         {"unit": "applications", "sub": "kpi:pest_apps_sub"}, 32, 0),
+        ("Organic Program", "kpi", "Sustainability", "kpi:organic_share",
+         {"unit": "%", "sub": "kpi:organic_sub"}, 33, 0),
+        ("Products Used — Health & Safety", "chemicals", "Sustainability", "chemicals",
+         {"span": 2}, 34, 0),
+        ("Applications by Product", "bar", "Sustainability", "chemicals",
+         {"span": 2, "value": "applications", "label": "name", "horizontal": True,
+          "unit": "applications", "limit": 11}, 35, 0),
+        ("Pest Pressure (times treated)", "doughnut", "Sustainability", "pest_pressure",
+         {"span": 2, "value": "applications", "label": "pest", "unit": "applications"}, 36, 0),
+        ("Spray Applications by Year", "bar", "Sustainability", "pesticide_annual",
+         {"span": 2, "value": "applications", "label": "year", "unit": "applications"}, 37, 0),
+        ("Recent Pesticide Applications", "table", "Sustainability", "pesticide_log",
+         {"span": 2, "columns": ["date", "crop", "pest", "scale", "product"], "limit": 20}, 38, 0),
+
+        # ── Team & task tracker ──────────────────────────────────────────────
+        ("Team Roster", "list", "Operations", "people", {"span": 2}, 39, 0),
+
+        # ── Livestock — egg production + chicken program (2026 logs) ──────────
+        ("Eggs Collected (2026)", "kpi", "Livestock", "kpi:total_eggs",
+         {"unit": "eggs", "sub": "kpi:eggs_sub"}, 40, 0),
+        ("Chicken Program Spend", "kpi", "Livestock", "kpi:chicken_spend",
+         {"unit": "USD", "money": True, "sub": "kpi:chicken_spend_sub"}, 41, 0),
+        ("Eggs Collected by Month", "bar", "Livestock", "eggs_monthly",
+         {"span": 2, "value": "total", "label": "label", "unit": "eggs"}, 42, 0),
+        ("Egg Type Mix (Brown vs Easter-Egger)", "doughnut", "Livestock", "egg_types",
+         {"span": 2, "value": "value", "label": "label", "unit": "eggs"}, 43, 0),
+        ("Chicken Purchases", "table", "Livestock", "livestock_costs",
+         {"span": 2, "columns": ["date", "item", "cost", "store", "flock"]}, 44, 0),
+        ("Chicken Inputs & Suppliers", "list", "Livestock", "chicken_sourcing",
+         {"span": 2}, 45, 0),
     ]
 
 
@@ -676,6 +848,15 @@ def backfill_defaults(c):
               (json.dumps({"span": 2, "value": "value", "label": "site",
                            "horizontal": True, "filter": {"analyte": "pH"}}),
                "Soil pH by Garden"))
+    # Enrich tasks that predate the priority/role columns — fill NULLs only, so
+    # user edits are never overwritten (idempotent; existing DBs get a complete
+    # tracker without reseeding).
+    if "tasks" in {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}:
+        c.execute("UPDATE tasks SET priority='medium' WHERE priority IS NULL OR priority=''")
+        c.execute("UPDATE tasks SET role=CASE "
+                  "WHEN lower(assignee) LIKE '%volunteer%' THEN 'volunteer' "
+                  "WHEN lower(assignee) LIKE '%intern%' THEN 'intern' "
+                  "ELSE 'employee' END WHERE role IS NULL OR role=''")
 
 
 # Templates the user can add from the dashboard "+ Add Widget" menu.
@@ -788,6 +969,23 @@ def dashboard_payload(conn):
     weather_alerts = rows(conn, "weather_alerts", "active DESC, rowid")
     active_alerts = sum(1 for a in weather_alerts if a["active"])
 
+    chemicals = rows(conn, "chemicals", "applications DESC")
+    pesticide_log = rows(conn, "pesticide_log", "date DESC, id DESC")
+    pest_pressure = rows(conn, "pest_pressure", "applications DESC")
+    pesticide_annual = rows(conn, "pesticide_annual", "year")
+    people = rows(conn, "people", "role, name")
+    organic_share = 100  # every product in the program is OMRI-listed / reduced-risk
+    total_apps = sum(a["applications"] for a in pesticide_annual)
+
+    eggs_monthly = rows(conn, "eggs_monthly", "month")
+    eggs_log = rows(conn, "eggs", "date DESC, id DESC")
+    livestock_costs = rows(conn, "livestock_costs", "id")
+    chicken_sourcing = rows(conn, "chicken_sourcing", "id")
+    total_eggs = sum(m["total"] for m in eggs_monthly)
+    total_brown = sum(m["brown"] for m in eggs_monthly)
+    total_other = sum(m["other"] for m in eggs_monthly)
+    chicken_spend = round(sum(x["cost"] for x in livestock_costs), 2)
+
     kpis = {
         "total_yield": round(total_yield),
         "harvest_sub": f"{len(crops)} crops · {sum(c['beds'] for c in crops)} beds",
@@ -810,6 +1008,14 @@ def dashboard_payload(conn):
         "lead_max": lead_max,
         "active_alerts": active_alerts,
         "alerts_sub": "impactful events flagged now" if active_alerts else "no active alerts",
+        "organic_share": organic_share,
+        "organic_sub": f"{len([ch for ch in chemicals if ch['caution']!='info'])} products · all OMRI-listed / reduced-risk",
+        "pest_apps": total_apps,
+        "pest_apps_sub": f"{pesticide_data.DATE_MIN[:4]}–{pesticide_data.DATE_MAX[:4]} · {len(pest_pressure)} pests tracked",
+        "total_eggs": total_eggs,
+        "eggs_sub": f"{total_brown} brown · {total_other} Easter-egger/blue · {len(eggs_monthly)} months",
+        "chicken_spend": chicken_spend,
+        "chicken_spend_sub": f"{len(livestock_costs)} purchases logged",
     }
 
     return {
@@ -829,6 +1035,17 @@ def dashboard_payload(conn):
         "soil_tests": soil_tests,
         "weather": weather,
         "weather_alerts": weather_alerts,
+        "chemicals": chemicals,
+        "pesticide_log": pesticide_log,
+        "pest_pressure": pest_pressure,
+        "pesticide_annual": pesticide_annual,
+        "eggs_monthly": eggs_monthly,
+        "eggs": eggs_log,
+        "egg_types": [{"label": "Brown", "value": total_brown},
+                      {"label": "Easter-Egger / Blue", "value": total_other}],
+        "livestock_costs": livestock_costs,
+        "chicken_sourcing": chicken_sourcing,
+        "people": people,
         "roadmap": rows(conn, "roadmap", "rowid"),
         "settings": settings,
         "widgets": rows(conn, "widgets", "position, id"),
