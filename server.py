@@ -1,31 +1,23 @@
 #!/usr/bin/env python3
 """AgriGrant Dashboard backend — Cerasee Farm & Urban GreenWorks.
 
-A single-file Python stdlib server (no pip installs) that serves the static
-frontend and a JSON REST API backed by SQLite. It is built around a *generic
-table registry* (see TABLES below) so new data and new dashboard widgets can be
-added/edited entirely from the admin page — nothing is hard-coded per table.
+Serves the static frontend and a JSON REST API backed by SQLite.
+Run: python3 server.py   (listens on http://localhost:7654)
 
-Run:  python3 server.py    →  http://localhost:7654
+This backend powers a category-organized, widget-based dashboard:
+  • Community Impact   produce distributed, families served, volunteer hours, CSA
+  • Crop Yields        yields by bed/crop and monthly progress
+  • Sustainability     carbon, soil nutrients, water, solar
+  • Crop Economics     cost & profit margin per crop
+  • Grants & Budget    grant utilization, budget by category
+  • Project Mgmt       tasks / to-dos / deadlines for staff & volunteers
+  • Field Map          bed layout
 
-API
-  GET    /api/dashboard            full payload the dashboard renders from
-  GET    /api/data/<table>         list rows of a registered table
-  POST   /api/data/<table>         insert a row     (body = row fields)
-  PUT    /api/data/<table>/<pk>    update a row by primary key
-  DELETE /api/data/<table>/<pk>    delete a row by primary key
-  PUT    /api/yield                upsert {crop_id, month 1-12, lbs}
-  GET    /api/widget-catalog       templates that can be added as widgets
-  POST   /api/sync                 pull Google Sheets now  (?table=<name> or all)
-  GET    /api/meta                 table schema + categories (drives the admin UI)
+Widgets are first-class records (add / delete / minimize / reorder), and a
+Google Sheets connector can refresh any data table on a weekly schedule.
 
-Google Sheets: each row in the `sheets` table maps a published-CSV URL to a
-target table. A background thread re-syncs every enabled connection weekly; the
-admin page also has a "Sync now" button. No Google credentials are required —
-the sheet just has to be "Published to the web" as CSV.
+See API map in the route table at the bottom of each do_* handler.
 """
-import csv
-import io
 import json
 import os
 import re
@@ -34,1389 +26,820 @@ import threading
 import time
 import urllib.request
 import urllib.error
-from urllib.parse import urlparse, parse_qs, unquote
-from datetime import datetime, timezone, date, timedelta
+import urllib.parse
+import csv
+import io
+from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
-
-import pesticide_data  # farm chemical cards + cleaned application log + aggregates
-import livestock_data  # egg log, chicken purchases + sourcing (cleaned)
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE, "agrigrant.db")
 PORT = 7654
-SYNC_INTERVAL_SECONDS = 7 * 24 * 60 * 60  # weekly
 
+PLOT_STATUSES = {"on-track", "at-risk", "delayed", "complete", "pending"}
+MILESTONE_STATES = {"done", "active", "pending"}
+TASK_STATUSES = {"todo", "in-progress", "blocked", "done"}
+TASK_PRIORITIES = {"low", "medium", "high"}
+ROADMAP_STATUSES = {"todo", "in-progress", "done"}
 MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Generic table registry.  Each table declares its primary key, whether the PK
-# auto-increments (integer rowid), and a column→type map.  Types: str, int,
-# float, json (stored as text, parsed on the way out).  The whole CRUD layer,
-# validation, and the admin editor are driven from this single structure, so
-# extending the system is a matter of adding an entry here + a seed.
-# ─────────────────────────────────────────────────────────────────────────────
-TABLES = {
-    "crops": {
-        "pk": "id", "auto": False, "category": "Crops & Yield", "label": "Crops",
-        "cols": {
-            "id": str, "name": str, "type": str, "beds": int, "status": str,
-            "yield_lbs": float, "cost": float, "price": float,
-            "nutrition": str, "culture": str, "herbal": str, "notes": str,
-        },
-    },
-    "crop_yield": {  # surrogate key so it fits the generic CRUD; (crop_id,month) unique
-        "pk": "id", "auto": True, "category": "Crops & Yield", "label": "Monthly Harvest",
-        "cols": {"id": int, "crop_id": str, "month": int, "lbs": float},
-        "unique": ("crop_id", "month"),
-    },
-    "beds": {
-        "pk": "id", "auto": False, "category": "Crops & Yield", "label": "Growing Map (Beds)",
-        "cols": {
-            "id": str, "name": str, "crop_id": str, "size_sqft": float,
-            "status": str, "x_pct": float, "y_pct": float,
-        },
-    },
-    "sustainability": {
-        "pk": "metric", "auto": False, "category": "Sustainability", "label": "Sustainability Metrics",
-        "cols": {
-            "metric": str, "label": str, "value": float, "unit": str,
-            "benchmark": float, "note": str,
-        },
-    },
-    "soil_tests": {  # populated from the 3 attached lab/university soil reports
-        "pk": "id", "auto": True, "category": "Soil", "label": "Soil Composition Tests",
-        "cols": {
-            "id": int, "site": str, "analyte": str, "value": float, "unit": str,
-            "threshold": float, "test_date": str, "lab": str,
-        },
-    },
-    "crop_log": {  # per-crop tracking aggregated from the seeding + harvest logs (since 2023)
-        "pk": "crop", "auto": False, "category": "Crops & Yield", "label": "Crop Tracking Log",
-        "cols": {
-            "crop": str, "seedlings": int, "trays": int,
-            "harvested": float, "germ": float,
-        },
-    },
-    "harvest_trend": {  # monthly harvest totals from the harvest log
-        "pk": "period", "auto": False, "category": "Crops & Yield", "label": "Harvest Trend (monthly)",
-        "cols": {"period": str, "units": float},
-    },
-    "community": {
-        "pk": "metric", "auto": False, "category": "Community Impact", "label": "Community Impact",
-        "cols": {
-            "metric": str, "label": str, "value": float, "unit": str,
-            "goal": float, "period": str,
-        },
-    },
-    "tasks": {
-        "pk": "id", "auto": True, "category": "Operations", "label": "Tasks & Deadlines",
-        "cols": {
-            "id": int, "title": str, "assignee": str, "role": str, "type": str,
-            "priority": str, "start": str, "due": str, "status": str, "notes": str,
-        },
-    },
-    "people": {  # volunteers / interns / employees who can be assigned tasks
-        "pk": "id", "auto": True, "category": "Operations", "label": "People (Team)",
-        "cols": {
-            "id": int, "name": str, "role": str, "phone": str,
-            "email": str, "active": int, "notes": str,
-        },
-    },
-    "budget": {
-        "pk": "category", "auto": False, "category": "Operations", "label": "Budget",
-        "cols": {"category": str, "allocated": float, "spent": float},
-    },
-    "milestones": {
-        "pk": "id", "auto": True, "category": "Operations", "label": "Grant Milestones",
-        "cols": {"id": int, "label": str, "date": str, "state": str},
-    },
-    "inputs": {
-        "pk": "name", "auto": False, "category": "Sustainability", "label": "Inputs & Compost",
-        "cols": {"name": str, "applied": float, "benchmark": float},
-    },
-    "chemicals": {  # pesticide/biopesticide reference cards w/ health + env info
-        "pk": "id", "auto": False, "category": "Sustainability", "label": "Farm Inputs — Health & Safety",
-        "cols": {
-            "id": str, "name": str, "active": str, "ptype": str, "origin": str,
-            "omri": str, "targets": str, "applications": int, "caution": str,
-            "health": str, "environment": str, "pollinators": str, "aquatic": str,
-            "sources": "json",
-        },
-    },
-    "pesticide_log": {  # cleaned spray-log applications (2023–2026)
-        "pk": "id", "auto": True, "category": "Sustainability", "label": "Pesticide Applications",
-        "cols": {
-            "id": int, "date": str, "crop": str, "bed": str, "pest": str,
-            "scale": int, "product": str, "chemicals": str, "dosage": str, "notes": str,
-        },
-    },
-    "pest_pressure": {  # applications + avg severity by pest (aggregate)
-        "pk": "pest", "auto": False, "category": "Sustainability", "label": "Pest Pressure",
-        "cols": {"pest": str, "applications": int, "avg_scale": float},
-    },
-    "pesticide_annual": {  # applications per year (aggregate)
-        "pk": "year", "auto": False, "category": "Sustainability", "label": "Applications by Year",
-        "cols": {"year": str, "applications": int},
-    },
-    # ── Livestock — egg production + chicken program (from the 2026 logs) ──────
-    "eggs": {
-        "pk": "id", "auto": True, "category": "Livestock", "label": "Egg Log (daily)",
-        "cols": {"id": int, "date": str, "flock": str, "total": int,
-                 "brown": int, "other": int, "feed": str, "staff": str},
-    },
-    "eggs_monthly": {
-        "pk": "month", "auto": False, "category": "Livestock", "label": "Eggs by Month",
-        "cols": {"month": str, "label": str, "total": int,
-                 "brown": int, "other": int, "avg_per_day": float},
-    },
-    "livestock_costs": {
-        "pk": "id", "auto": True, "category": "Livestock", "label": "Chicken Purchases",
-        "cols": {"id": int, "date": str, "item": str, "cost": float,
-                 "store": str, "flock": str},
-    },
-    "chicken_sourcing": {
-        "pk": "id", "auto": True, "category": "Livestock", "label": "Chicken Inputs & Suppliers",
-        "cols": {"id": int, "product": str, "brand": str, "supplier": str, "notes": str},
-    },
-    "weather": {  # monthly Miami climate, to compare against harvest over the year
-        "pk": "month", "auto": False, "category": "Weather", "label": "Miami Weather (monthly)",
-        "cols": {"month": int, "label": str, "rainfall_in": float,
-                 "temp_avg_f": float, "temp_high_f": float, "note": str},
-    },
-    "weather_alerts": {  # impactful events: drought / flood / hurricane / heat / frost
-        "pk": "id", "auto": True, "category": "Weather", "label": "Weather Alerts",
-        "cols": {"id": int, "type": str, "severity": str, "date": str,
-                 "title": str, "note": str, "active": int},
-    },
-    "partners": {
-        "pk": "id", "auto": True, "category": "Partners", "label": "Community Partners",
-        "cols": {
-            "id": int, "name": str, "type": str, "contact": str,
-            "contribution": str, "notes": str,
-        },
-    },
-    "settings": {
-        "pk": "key", "auto": False, "category": "Operations", "label": "Project Settings",
-        "cols": {"key": str, "value": float},
-    },
-    "roadmap": {  # wishlist of future data assets / widgets to integrate
-        "pk": "id", "auto": True, "category": "Roadmap", "label": "Data Roadmap",
-        "cols": {"id": int, "name": str, "category": str, "status": str, "note": str},
-    },
-    "widgets": {
-        "pk": "id", "auto": True, "category": "Dashboard", "label": "Widgets",
-        "cols": {
-            "id": int, "title": str, "type": str, "category": str,
-            "source": str, "config": "json", "position": int, "minimized": int,
-        },
-    },
-    "sheets": {
-        "pk": "id", "auto": True, "category": "Integrations", "label": "Google Sheets Sync",
-        "cols": {
-            "id": int, "target_table": str, "csv_url": str,
-            "enabled": int, "last_synced": str, "last_status": str,
-        },
-    },
+# Widget catalog — every chart/table the frontend knows how to render.
+# category is used by the sidebar filter; "kind" maps to a renderer in app.js.
+# "source" names the dataset a widget draws from — used to link the widget to
+# the Google Sheet / Excel it originated from when the widget is expanded.
+# "human" is the embodied-design anchor: a one-line reminder that the number
+# stands for people, labor, and living soil — never data for its own sake.
+WIDGET_CATALOG = {
+    # Community Impact
+    "community_kpis":   {"title": "Community Impact (KPIs)",          "category": "community",      "kind": "community_kpis",  "span": 4, "source": "community",      "human": "Every pound here is a meal on a Liberty City table — generosity made countable, not the point of the work."},
+    "produce_dist":     {"title": "Produce Distributed by Month",     "category": "community",      "kind": "line_produce",    "span": 2, "source": "community",      "human": "A rising line is hands harvesting, sorting, and carrying food to neighbors who needed it."},
+    "csa_shares":       {"title": "CSA Shares & Families Served",     "category": "community",      "kind": "community_table", "span": 2, "source": "community",      "human": "Each share is a household in relationship with this farm, not a transaction."},
+    # Crop Yields
+    "yield_line":       {"title": "Monthly Yield Progress",           "category": "yields",         "kind": "yield_line",      "span": 2, "source": "monthly_yield",  "human": "Yield is the visible end of patience — soil worked season after season until it answers."},
+    "crop_pie":         {"title": "Crop Distribution by Bed Area",    "category": "yields",         "kind": "crop_pie",        "span": 2, "source": "plots",          "human": "How the land is shared among crops reflects choices made by the growers who tend each bed."},
+    "plot_table":       {"title": "Bed / Plot Status Summary",        "category": "yields",         "kind": "plot_table",      "span": 2, "source": "plots",          "human": "Behind every 'on-track' bed is someone who showed up to weed, water, and watch it."},
+    "yield_kpi":        {"title": "Total Yield (YTD)",                "category": "yields",         "kind": "kpi_yield",       "span": 1, "source": "plots",          "human": "One number for a year of effort, weather, and restraint."},
+    # Sustainability
+    "carbon_kpi":       {"title": "Carbon Sequestered (YTD)",         "category": "sustainability", "kind": "kpi_carbon",      "span": 1, "source": "sustainability", "human": "Carbon held in living soil — wisdom the ground keeps that no certificate can replace."},
+    "water_kpi":        {"title": "Water Used (YTD)",                 "category": "sustainability", "kind": "kpi_water",       "span": 1, "source": "sustainability", "human": "Water is borrowed, not owned — restraint measured in gallons."},
+    "solar_kpi":        {"title": "Solar Generated (YTD)",            "category": "sustainability", "kind": "kpi_solar",       "span": 1, "source": "sustainability", "human": "Energy the farm makes rather than takes."},
+    "soil_moisture":    {"title": "Avg Soil Moisture",                "category": "sustainability", "kind": "moisture_gauge",  "span": 1, "source": "settings",       "human": "The body knows before the gauge does — a grower feels dry soil underfoot."},
+    "sustainability_trend": {"title": "Sustainability Trends",        "category": "sustainability", "kind": "sustain_line",    "span": 2, "source": "sustainability", "human": "Regeneration doesn't respond to urgency; these lines move at the land's own pace."},
+    "soil_nutrients":   {"title": "Soil Nutrient Makeup (NPK)",       "category": "sustainability", "kind": "inputs_chart",    "span": 2, "source": "inputs",         "human": "Hands in soil are a form of knowing that reading about soil cannot substitute for."},
+    # Crop Economics
+    "econ_table":       {"title": "Cost & Profit Margin by Crop",     "category": "economics",      "kind": "econ_table",      "span": 4, "source": "economics",      "human": "Pricing that doesn't extract maximum margin from a food-insecure neighborhood is a value, made visible here as a choice."},
+    "margin_chart":     {"title": "Profit Margin by Crop",            "category": "economics",      "kind": "margin_chart",    "span": 2, "source": "economics",      "human": "Margin funds the mission; it is never the mission."},
+    # Grants & Budget
+    "grant_kpi":        {"title": "Grant Utilization",                "category": "grants",         "kind": "kpi_utilization", "span": 1, "source": "budget",         "human": "Truthfulness to funders: what was promised, what was spent, plainly."},
+    "budget_chart":     {"title": "Budget Allocated vs. Spent",       "category": "grants",         "kind": "budget_chart",    "span": 2, "source": "budget",         "human": "Stewardship of trust others placed in this farm."},
+    "budget_progress":  {"title": "Grant Budget Progress",            "category": "grants",         "kind": "budget_progress", "span": 1, "source": "budget",         "human": "Determination across a slow grant year, category by category."},
+    "timeline":         {"title": "Project Milestones",               "category": "grants",         "kind": "timeline",        "span": 2, "source": "milestones",     "human": "Follow-through when the payoff is delayed."},
+    # Project Management
+    "task_board":       {"title": "Tasks & To-Dos",                   "category": "tasks",          "kind": "task_table",      "span": 4, "source": "tasks",          "human": "The unglamorous daily labor — weeding, watering, tending — that regeneration actually requires, and the people doing it."},
+    "roadmap":          {"title": "Milestone Roadmap",                "category": "tasks",          "kind": "roadmap",         "span": 4, "source": "roadmap",        "human": "Determination and follow-through — the farm's commitments across the seasons ahead."},
+    "deadlines":        {"title": "Upcoming Grant Deadlines",         "category": "tasks",          "kind": "deadline_list",   "span": 2, "source": "deadlines",      "human": "Commitments the farm keeps to the community that funds it."},
+    # CSA Program
+    "csa_kpis":         {"title": "CSA Program (KPIs)",               "category": "csa",            "kind": "csa_kpis",        "span": 4, "source": "csa",            "human": "Each order is a household choosing this farm week after week — relationship, not just revenue."},
+    "csa_orders_line":  {"title": "CSA Orders Over Time",             "category": "csa",            "kind": "csa_orders_line", "span": 2, "source": "csa",            "human": "A season of pickups, deliveries, and the people who kept coming back."},
+    "csa_shares_pie":   {"title": "Farm Share Popularity",           "category": "csa",            "kind": "csa_shares_pie",  "span": 2, "source": "csa",            "human": "What neighbors actually want on their tables."},
+    "csa_monthly_sales":{"title": "CSA Sales by Month",              "category": "csa",            "kind": "csa_monthly_sales","span": 2, "source": "csa",           "human": "Income that keeps the fair-wage, chemical-free model viable."},
+    "csa_orders_table": {"title": "CSA Order Breakdown",             "category": "csa",            "kind": "csa_orders_table","span": 4, "source": "csa",            "human": "Every order: who, when, where, and how much — the community made legible."},
+    # Field Map
+    "field_map":        {"title": "Field / Bed Map",                  "category": "map",            "kind": "field_map",       "span": 2, "source": "plots",          "human": "This is a place, not a grid — walked daily by the people who grow here."},
+    # Purpose & Practice (embodiment layer)
+    "guiding_foundations": {"title": "The Three Foundations",         "category": "purpose",        "kind": "foundations",     "span": 2, "source": "framework",      "human": "The ground everything above stands on: morality, mind-mastery, wisdom."},
+    "ten_perfections":  {"title": "Ten Perfections in the Field",     "category": "purpose",        "kind": "perfections",     "span": 2, "source": "framework",      "human": "Values a farmer practices with their body until they become their own."},
+    "agriworks_curriculum": {"title": "AgriWorks Curriculum (13 Weeks)", "category": "purpose",     "kind": "curriculum",      "span": 4, "source": "framework",      "human": "Practice comes first; the naming of the value comes after."},
+    "field_reflection": {"title": "Field Reflection",                 "category": "purpose",        "kind": "reflection",      "span": 2, "source": "framework",      "human": "A question to carry into the beds today."},
 }
 
-VALID_STATES = {"milestones": {"done", "active", "pending"}}
+CATEGORIES = [
+    {"id": "purpose",       "label": "Purpose & Practice", "icon": "🌿",
+     "principle": "Farming here is spiritual, physical, and sacred — food is grown as practice, not only product."},
+    {"id": "community",      "label": "Community Impact",  "icon": "🤝",
+     "principle": "Generosity — loosening the grip of ownership over what the land produces."},
+    {"id": "csa",            "label": "CSA Program",       "icon": "🧺",
+     "principle": "Loving-Kindness — a standing relationship with the households the farm feeds."},
+    {"id": "yields",         "label": "Crop Yields",       "icon": "🌽",
+     "principle": "Patience & Wisdom — soil verified by working it, season after season."},
+    {"id": "sustainability", "label": "Sustainability",    "icon": "🌱",
+     "principle": "Renunciation — restraint as strength: taking less than the land could give."},
+    {"id": "economics",      "label": "Crop Economics",    "icon": "💵",
+     "principle": "Morality — honest treatment of land, labor, and eaters alike."},
+    {"id": "grants",         "label": "Grants & Budget",   "icon": "📋",
+     "principle": "Truthfulness — alignment between what is practiced and what is claimed."},
+    {"id": "tasks",          "label": "Project Mgmt",      "icon": "✅",
+     "principle": "Effort — right-directed, sustained exertion, not sporadic bursts."},
+    {"id": "map",            "label": "Field Map",         "icon": "🗺️",
+     "principle": "Mind-Mastery — observe the site patiently before intervening."},
+]
+
+# ── Embodiment framework (Purpose Driven Farming) ────────────────────────────
+# Static reference content served to the dashboard so the human, values-based
+# dimension of the work is structural, not decorative. Drawn from the farm's
+# "Purpose Driven Farming" synthesis (Three Foundations + Ten Perfections).
+EMBODIMENT = {
+    "tagline": "Where food is grown as practice, not just product.",
+    "foundations": [
+        {"name": "Morality",      "practice": "Organic practice",
+         "meaning": "Refusing inputs and shortcuts that harm soil, workers, or eaters — even when conventional methods are faster or cheaper.",
+         "embodied": "The body knows before the mind agrees — a farmer feels when a shortcut is wrong before they can justify why."},
+        {"name": "Mind-Mastery",  "practice": "Permaculture design",
+         "meaning": "Observing a site patiently before intervening; building systems that hold their pattern instead of reacting plot-by-plot.",
+         "embodied": "Concentration isn't forcing an outcome; it's staying present long enough for the land's own logic to become visible."},
+        {"name": "Wisdom",        "practice": "Regenerative farming",
+         "meaning": "Soil health verified by working it season after season, not by theory or certification alone.",
+         "embodied": "Hands in soil are a form of knowing that reading about soil can't substitute for."},
+    ],
+    "perfections": [
+        {"name": "Generosity",     "field": "Seed saving, gleaning for the community, pricing that doesn't extract maximum margin from a food-insecure neighborhood.", "trains": "Loosening the grip of ownership over what the land produces."},
+        {"name": "Morality",       "field": "Fair wages, chemical-free inputs, honest treatment of land and labor alike.", "trains": "The ethical floor everything else stands on."},
+        {"name": "Renunciation",   "field": "Letting a field lie fallow; refusing to over-plant or over-extract even when demand is there.", "trains": "Restraint as strength, not loss."},
+        {"name": "Wisdom",         "field": "Reading the soil, the pests, the weather directly — a feedback loop between action and observed result.", "trains": "Experiential knowledge over borrowed theory."},
+        {"name": "Effort",         "field": "The unglamorous daily labor — weeding, watering, tending — that compost and cover crops require.", "trains": "Right-directed, sustained exertion, not sporadic bursts."},
+        {"name": "Patience",       "field": "Waiting out compost maturation, a three-year soil transition, a slow cover-crop cycle.", "trains": "Regeneration doesn't respond to urgency."},
+        {"name": "Truthfulness",   "field": "Transparent sourcing, honest labeling, not overselling 'regenerative' or 'organic' claims.", "trains": "Alignment between what's practiced and what's claimed."},
+        {"name": "Determination",  "field": "Staying with a multi-season transition through bad harvests and slow years.", "trains": "Follow-through when the payoff is delayed."},
+        {"name": "Loving-Kindness","field": "Care extended to workers, neighbors, pollinators, and the soil microbiome — not just the customer.", "trains": "Goodwill as an active practice, not sentiment."},
+        {"name": "Equanimity",     "field": "Steady response to drought, pest pressure, or a bad market — neither panicking nor forcing a reactive fix.", "trains": "Non-reactive stability under real conditions."},
+    ],
+    "curriculum": [
+        {"phase": "Foundations", "week": 1,  "anchor": "Morality (Organic)",        "task": "Learn why the farm refuses synthetic inputs; handle compost, mulch, and amendments hands-on.", "prompt": "What's a shortcut you've taken elsewhere that you now see differently?"},
+        {"phase": "Foundations", "week": 2,  "anchor": "Mind-Mastery (Permaculture)","task": "Site observation — map water flow, sun, and plant relationships on one bed before touching it.", "prompt": "What did you notice only because you waited before acting?"},
+        {"phase": "Foundations", "week": 3,  "anchor": "Wisdom (Regenerative)",      "task": "Soil test + direct comparison against a conventionally treated plot.", "prompt": "What did the soil tell you that a textbook couldn't?"},
+        {"phase": "What You Refuse", "week": 4, "anchor": "Generosity",              "task": "Participate in a gleaning or community harvest distribution.", "prompt": "What did giving away food you helped grow feel like?"},
+        {"phase": "What You Refuse", "week": 5, "anchor": "Morality (labor ethics)", "task": "Shadow payroll/labor practices; discuss the fair-wage structure of AgriWorks itself.", "prompt": "How does knowing your own wage is fair change how you work?"},
+        {"phase": "What You Refuse", "week": 6, "anchor": "Renunciation",            "task": "Deliberately leave a bed fallow or under-harvest a ready crop.", "prompt": "What did it cost you to hold back, and what did it protect?"},
+        {"phase": "What You Sustain", "week": 7, "anchor": "Effort",                 "task": "A full week of unglamorous maintenance — weeding, watering, tool care.", "prompt": "What's the difference between forcing effort and sustaining it?"},
+        {"phase": "What You Sustain", "week": 8, "anchor": "Patience",               "task": "Turn and monitor an active compost pile; track a slow crop from seed.", "prompt": "Where else in your life are you rushing something that needs time?"},
+        {"phase": "What You Sustain", "week": 9, "anchor": "Determination",          "task": "Work through a real setback — pest damage, weather loss, a failed bed — and replant.", "prompt": "What almost made you quit, and what didn't?"},
+        {"phase": "What You Sustain", "week": 10, "anchor": "Mid-program review",     "task": "Cohort discussion connecting Weeks 1–9 to personal values named or discovered so far.", "prompt": "Which value has surprised you by mattering?"},
+        {"phase": "What You Extend", "week": 11, "anchor": "Truthfulness",           "task": "Help write honest produce labeling and customer-facing materials.", "prompt": "What's the difference between marketing and honesty?"},
+        {"phase": "What You Extend", "week": 12, "anchor": "Loving-Kindness",        "task": "Pollinator habitat work or a care task directed at something that gives nothing back directly.", "prompt": "Who or what did you care for today with no expectation of return?"},
+        {"phase": "What You Extend", "week": 13, "anchor": "Equanimity",             "task": "Closing session: respond to a simulated setback (market, weather, staffing) as a group, calmly.", "prompt": "What did thirteen weeks of this practice change about how you react to problems?"},
+    ],
+    "reflections": [
+        "What did you notice today only because you waited before acting?",
+        "What did the soil tell you that a textbook couldn't?",
+        "Where are you rushing something that needs time?",
+        "Who or what did you care for today with no expectation of return?",
+        "What's a shortcut you now see differently?",
+        "What did it cost you to hold back — and what did it protect?",
+        "What almost made you quit, and what didn't?",
+        "What's the difference between forcing effort and sustaining it?",
+    ],
+    # How each dataset reaches the dashboard, for the "source data" link when a
+    # widget is expanded. Syncable targets map to a Google Sheet; the rest are
+    # edited directly on the Manage Data page.
+    "source_labels": {
+        "community":      "Community impact sheet",
+        "monthly_yield":  "Monthly yield sheet",
+        "plots":          "Beds / plots sheet",
+        "sustainability": "Sustainability sheet",
+        "inputs":         "Soil inputs (NPK) sheet",
+        "economics":      "Crop economics sheet",
+        "budget":         "Grant budget sheet",
+        "csa":            "Farmhand CSA orders export (Excel)",
+        "settings":       "Farm settings (Manage Data)",
+        "milestones":     "Milestones (Manage Data)",
+        "tasks":          "Tasks (Manage Data)",
+        "deadlines":      "Deadlines (Manage Data)",
+        "framework":      "Purpose Driven Farming framework",
+    },
+}
 
 
 def connect():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
-def coldef(t):
-    if t is int:
-        return "INTEGER"
-    if t is float:
-        return "REAL"
-    return "TEXT"  # str and "json"
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
 
 
 def init_db():
     conn = connect()
     c = conn.cursor()
-    for name, spec in TABLES.items():
-        cols = []
-        for col, t in spec["cols"].items():
-            if col == spec["pk"]:
-                if spec["auto"]:
-                    cols.append(f"{col} INTEGER PRIMARY KEY AUTOINCREMENT")
-                else:
-                    cols.append(f"{col} {coldef(t)} PRIMARY KEY")
-            else:
-                cols.append(f"{col} {coldef(t)}")
-        ddl = f"CREATE TABLE IF NOT EXISTS {name} ({', '.join(cols)}"
-        if spec.get("unique"):
-            ddl += f", UNIQUE({', '.join(spec['unique'])})"
-        ddl += ")"
-        c.execute(ddl)
-    # Cerasee AI assistant config — kept OUT of the TABLES registry so the API
-    # key is never exposed through the generic /api/data or /api/dashboard.
-    c.execute("CREATE TABLE IF NOT EXISTS ai_settings (key TEXT PRIMARY KEY, value TEXT)")
-    migrate_columns(c)  # add any columns introduced after a DB was first created
+    c.executescript("""
+      CREATE TABLE IF NOT EXISTS plots (
+        id       TEXT PRIMARY KEY,
+        crop     TEXT NOT NULL,
+        acres    REAL NOT NULL DEFAULT 0,
+        yield_bu REAL NOT NULL DEFAULT 0,
+        status   TEXT NOT NULL DEFAULT 'pending',
+        x_pct    REAL NOT NULL DEFAULT 50,
+        y_pct    REAL NOT NULL DEFAULT 50
+      );
+      CREATE TABLE IF NOT EXISTS budget (
+        category  TEXT PRIMARY KEY,
+        allocated REAL NOT NULL DEFAULT 0,
+        spent     REAL NOT NULL DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS milestones (
+        id    INTEGER PRIMARY KEY,
+        label TEXT NOT NULL,
+        date  TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'pending'
+      );
+      CREATE TABLE IF NOT EXISTS monthly_yield (
+        month   INTEGER NOT NULL CHECK (month BETWEEN 1 AND 12),
+        crop    TEXT NOT NULL,
+        bushels REAL NOT NULL DEFAULT 0,
+        PRIMARY KEY (month, crop)
+      );
+      CREATE TABLE IF NOT EXISTS inputs (
+        name      TEXT PRIMARY KEY,
+        applied   REAL NOT NULL DEFAULT 0,
+        benchmark REAL NOT NULL DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS settings (
+        key   TEXT PRIMARY KEY,
+        value REAL NOT NULL
+      );
+
+      -- ── New tables for the expanded scope ──
+      CREATE TABLE IF NOT EXISTS widgets (
+        wid       TEXT PRIMARY KEY,        -- catalog key, e.g. "yield_line"
+        sort      INTEGER NOT NULL DEFAULT 0,
+        minimized INTEGER NOT NULL DEFAULT 0,
+        visible   INTEGER NOT NULL DEFAULT 1
+      );
+      CREATE TABLE IF NOT EXISTS community (
+        month     INTEGER PRIMARY KEY CHECK (month BETWEEN 1 AND 12),
+        lbs_dist  REAL NOT NULL DEFAULT 0,   -- pounds of produce distributed
+        families  INTEGER NOT NULL DEFAULT 0,
+        volunteer_hrs REAL NOT NULL DEFAULT 0,
+        csa_shares INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS sustainability (
+        month       INTEGER PRIMARY KEY CHECK (month BETWEEN 1 AND 12),
+        carbon_kg   REAL NOT NULL DEFAULT 0, -- kg CO2 sequestered
+        water_gal   REAL NOT NULL DEFAULT 0, -- gallons used
+        solar_kwh   REAL NOT NULL DEFAULT 0  -- kWh generated
+      );
+      CREATE TABLE IF NOT EXISTS economics (
+        crop        TEXT PRIMARY KEY,
+        cost        REAL NOT NULL DEFAULT 0,   -- $ input cost
+        revenue     REAL NOT NULL DEFAULT 0,   -- $ revenue / value
+        unit        TEXT NOT NULL DEFAULT 'season'
+      );
+      CREATE TABLE IF NOT EXISTS tasks (
+        id        INTEGER PRIMARY KEY AUTOINCREMENT,
+        title     TEXT NOT NULL,
+        assignee  TEXT NOT NULL DEFAULT '',
+        due       TEXT NOT NULL DEFAULT '',
+        priority  TEXT NOT NULL DEFAULT 'medium',
+        status    TEXT NOT NULL DEFAULT 'todo'
+      );
+      CREATE TABLE IF NOT EXISTS deadlines (
+        id        INTEGER PRIMARY KEY AUTOINCREMENT,
+        grant     TEXT NOT NULL,
+        item      TEXT NOT NULL,
+        due       TEXT NOT NULL DEFAULT ''
+      );
+      -- Roadmap: the farm's phased milestones (funding, launches, ongoing work)
+      CREATE TABLE IF NOT EXISTS roadmap (
+        id        INTEGER PRIMARY KEY AUTOINCREMENT,
+        phase     TEXT NOT NULL DEFAULT '',      -- e.g. "Near-Term (Sep 2026)"
+        item      TEXT NOT NULL,
+        detail    TEXT NOT NULL DEFAULT '',
+        due       TEXT NOT NULL DEFAULT '',       -- target window
+        category  TEXT NOT NULL DEFAULT 'general',-- funding|launch|farm-stand|program|legal|ongoing
+        status    TEXT NOT NULL DEFAULT 'todo',   -- todo|in-progress|done
+        sort      INTEGER NOT NULL DEFAULT 0
+      );
+      -- CSA orders (imported from the Farmhand export; one row per order)
+      CREATE TABLE IF NOT EXISTS csa_orders (
+        id        INTEGER PRIMARY KEY AUTOINCREMENT,
+        order_date TEXT NOT NULL DEFAULT '',   -- ISO yyyy-mm-dd
+        month     TEXT NOT NULL DEFAULT '',     -- yyyy-mm
+        customer  TEXT NOT NULL DEFAULT '',
+        email     TEXT NOT NULL DEFAULT '',
+        phone     TEXT NOT NULL DEFAULT '',
+        location  TEXT NOT NULL DEFAULT '',
+        zone      TEXT NOT NULL DEFAULT '',
+        dietary   TEXT NOT NULL DEFAULT '',
+        status    TEXT NOT NULL DEFAULT '',
+        items     TEXT NOT NULL DEFAULT '{}'    -- JSON {item: qty}
+      );
+      -- Editable CSA unit prices (source export has no price column)
+      CREATE TABLE IF NOT EXISTS csa_prices (
+        item  TEXT PRIMARY KEY,
+        price REAL NOT NULL DEFAULT 0
+      );
+      -- Google Sheets connections: one row per data table that can sync
+      CREATE TABLE IF NOT EXISTS sheet_sources (
+        target      TEXT PRIMARY KEY,   -- which table this feeds, e.g. "plots"
+        sheet_url   TEXT NOT NULL DEFAULT '',
+        enabled     INTEGER NOT NULL DEFAULT 0,
+        last_sync   TEXT NOT NULL DEFAULT '',
+        last_status TEXT NOT NULL DEFAULT ''
+      );
+    """)
+
+    # ── Seed first-run data ──
+    if c.execute("SELECT COUNT(*) FROM plots").fetchone()[0] == 0:
+        c.executemany(
+            "INSERT INTO plots VALUES (?,?,?,?,?,?,?)",
+            [
+                ("Bed-1",  "Callaloo",     0.1, 320, "on-track", 25, 30),
+                ("Bed-2",  "Sweet Potato", 0.2, 410, "on-track", 42, 22),
+                ("Bed-3",  "Okra",         0.1, 180, "at-risk",  68, 55),
+                ("Bed-4",  "Cover Crop",   0.2,   0, "delayed",  38, 72),
+                ("Bed-5",  "Collards",     0.1, 260, "complete", 50, 45),
+                ("Bed-6",  "Cerasee",      0.1, 140, "on-track", 60, 28),
+            ],
+        )
+        c.executemany(
+            "INSERT INTO budget VALUES (?,?,?)",
+            [
+                ("Staff & Labor",   95000, 71000),
+                ("Equipment",       40000, 28000),
+                ("Seeds & Inputs",  22000, 15500),
+                ("Irrigation",      18000, 11200),
+                ("Education",       26000, 9000),
+                ("Admin",           14000, 4200),
+            ],
+        )
+        c.executemany(
+            "INSERT INTO milestones VALUES (?,?,?,?)",
+            [
+                (1, "Grant Awarded",          "Jan 2026", "done"),
+                (2, "Site & Soil Assessment", "Feb 2026", "done"),
+                (3, "Spring Planting",        "Mar 2026", "done"),
+                (4, "Mid-Season Report",      "Jun 2026", "active"),
+                (5, "Fall Harvest",           "Sep 2026", "pending"),
+                (6, "Annual Impact Report",   "Dec 2026", "pending"),
+            ],
+        )
+        yields = {
+            "Callaloo":     [0, 20, 60, 120, 180, 240, 300, 320, 210, 90, 0, 0],
+            "Sweet Potato": [0, 0, 0, 40, 110, 190, 280, 360, 410, 220, 0, 0],
+            "Collards":     [80, 120, 160, 200, 240, 180, 60, 0, 40, 160, 220, 260],
+        }
+        c.executemany(
+            "INSERT INTO monthly_yield VALUES (?,?,?)",
+            [(m + 1, crop, bu) for crop, row in yields.items()
+             for m, bu in enumerate(row)],
+        )
+        c.executemany(
+            "INSERT INTO inputs VALUES (?,?,?)",
+            [
+                ("Nitrogen (N)",   38, 45),
+                ("Phosphorus (P)", 22, 28),
+                ("Potassium (K)",  41, 50),
+                ("Organic Matter", 6.2, 5.0),
+                ("Compost",        12, 10),
+            ],
+        )
+        c.executemany(
+            "INSERT INTO settings VALUES (?,?)",
+            [
+                ("soil_moisture", 44),
+                ("soil_health",   7.8),
+                ("grant_total",   215000),
+            ],
+        )
+        # Community impact (Jan–Dec)
+        community = [
+            (1, 180, 22, 40, 18), (2, 240, 28, 55, 20), (3, 420, 41, 72, 24),
+            (4, 680, 58, 96, 30), (5, 910, 73, 120, 34), (6, 1180, 88, 142, 38),
+            (7, 1320, 95, 150, 40), (8, 1410, 102, 138, 40), (9, 980, 80, 110, 36),
+            (10, 540, 52, 78, 28), (11, 260, 30, 50, 20), (12, 150, 18, 32, 16),
+        ]
+        c.executemany("INSERT INTO community VALUES (?,?,?,?,?)", community)
+        # Sustainability (carbon kg, water gal, solar kWh) per month
+        sustain = [
+            (1, 210, 4200, 380), (2, 240, 4600, 440), (3, 380, 6800, 560),
+            (4, 520, 9200, 680), (5, 690, 12400, 760), (6, 820, 15600, 820),
+            (7, 910, 17200, 880), (8, 870, 16400, 840), (9, 640, 11800, 700),
+            (10, 410, 7400, 560), (11, 250, 4800, 420), (12, 190, 3900, 360),
+        ]
+        c.executemany("INSERT INTO sustainability VALUES (?,?,?,?)", sustain)
+        # Economics — cost vs revenue per crop, per season
+        c.executemany(
+            "INSERT INTO economics VALUES (?,?,?,?)",
+            [
+                ("Callaloo",     420, 1180, "season"),
+                ("Sweet Potato", 510, 1620, "season"),
+                ("Okra",         360,  640, "season"),
+                ("Collards",     390, 1240, "season"),
+                ("Cerasee",      280,  980, "season"),
+            ],
+        )
+        # Tasks
+        c.executemany(
+            "INSERT INTO tasks (title, assignee, due, priority, status) VALUES (?,?,?,?,?)",
+            [
+                ("Order spring seed stock",        "Maria",      "2026-02-15", "high",   "done"),
+                ("Repair Bed-4 drip line",         "Volunteer",  "2026-06-25", "high",   "in-progress"),
+                ("Submit mid-season grant report", "Madeline",   "2026-06-30", "high",   "in-progress"),
+                ("Schedule June CSA pickups",      "Maria",      "2026-06-20", "medium", "todo"),
+                ("Soil test — beds 3 & 4",         "Volunteer",  "2026-07-05", "medium", "todo"),
+                ("Plan fall cover crop rotation",  "Director",   "2026-08-01", "low",    "todo"),
+            ],
+        )
+        # Grant deadlines
+        c.executemany(
+            "INSERT INTO deadlines (grant, item, due) VALUES (?,?,?)",
+            [
+                ("USDA Urban Ag", "Mid-season financial report", "2026-06-30"),
+                ("Knight Found.", "Community impact narrative",   "2026-07-15"),
+                ("USDA Urban Ag", "Carbon-credit data export",    "2026-09-01"),
+                ("City Green Fund","Annual renewal application",  "2026-10-10"),
+            ],
+        )
+        # Default widget layout — everything visible, in catalog order.
+        # The embodiment layer leads, so the human/values frame is the first
+        # thing seen, not an afterthought below the metrics.
+        order = ["field_reflection", "guiding_foundations", "ten_perfections",
+                 "community_kpis", "grant_kpi", "yield_kpi", "carbon_kpi",
+                 "produce_dist", "yield_line", "budget_chart", "crop_pie",
+                 "field_map", "plot_table", "sustainability_trend", "soil_nutrients",
+                 "soil_moisture", "budget_progress", "timeline", "csa_shares",
+                 "csa_kpis", "csa_orders_line", "csa_shares_pie", "csa_monthly_sales",
+                 "csa_orders_table",
+                 "econ_table", "margin_chart", "task_board", "roadmap", "deadlines",
+                 "water_kpi", "solar_kpi", "agriworks_curriculum"]
+        c.executemany(
+            "INSERT INTO widgets (wid, sort, minimized, visible) VALUES (?,?,0,1)",
+            [(w, i) for i, w in enumerate(order)],
+        )
+        # Sheet source rows (one per syncable table), disabled by default
+        c.executemany(
+            "INSERT INTO sheet_sources (target, sheet_url, enabled) VALUES (?,?,0)",
+            [(t, "") for t in ("plots", "budget", "monthly_yield", "inputs",
+                                "community", "sustainability", "economics")],
+        )
+
+    # Migration safety: ensure widget rows exist for any new catalog keys
+    existing = {r["wid"] for r in c.execute("SELECT wid FROM widgets")}
+    if existing:  # only if widgets table was already seeded
+        maxsort = c.execute("SELECT COALESCE(MAX(sort),0) FROM widgets").fetchone()[0]
+        for i, wid in enumerate(WIDGET_CATALOG):
+            if wid not in existing:
+                c.execute("INSERT INTO widgets (wid, sort, minimized, visible) VALUES (?,?,0,1)",
+                          (wid, maxsort + 1 + i))
+
+    # Seed the roadmap (idempotent — also populates pre-existing databases).
+    if c.execute("SELECT COUNT(*) FROM roadmap").fetchone()[0] == 0:
+        c.executemany(
+            "INSERT INTO roadmap (phase, item, detail, due, category, status, sort) "
+            "VALUES (?,?,?,?,?,?,?)",
+            [
+                # ── Near-term (September 2026) ──
+                ("Near-Term (Sep 2026)", "Florida Blue Community Investments",
+                 "Rolling application — submit when ready.", "Sep 2026", "funding", "todo", 0),
+                ("Near-Term (Sep 2026)", "Health Foundation of South Florida",
+                 "Follow up on rolling inquiry via GOapply.", "Sep 2026", "funding", "todo", 1),
+                ("Near-Term (Sep 2026)", "Walmart Spark Good Local Grants",
+                 "Submit for both store locations.", "Sep 2026", "funding", "todo", 2),
+                ("Near-Term (Sep 2026)", "Co-founder agreement (AI analytics dashboard)",
+                 "Move v3 documents toward execution; finalize new LLC structure, Background IP license from HGM, vesting/equity terms.",
+                 "Sep 2026", "legal", "in-progress", 3),
+                ("Near-Term (Sep 2026)", "Farm field trip outreach campaign",
+                 "Launch outreach to schools/childcare centers within 10 miles of Cerasee Farm.",
+                 "Sep 2026", "program", "todo", 4),
+                ("Near-Term (Sep 2026)", "Tesla vehicle / EV charger donation request",
+                 "Submit or follow up.", "Sep 2026", "funding", "todo", 5),
+                # ── October 2026 — Commercial Launch Target ──
+                ("October 2026 — Commercial Launch", "UGW Enterprises (Urban Rootz)",
+                 "Execute launch per Business Plan v8.", "Oct 2026", "launch", "todo", 6),
+                ("October 2026 — Commercial Launch", "BIO-copia LLC",
+                 "Execute launch per Business Plan v7.", "Oct 2026", "launch", "todo", 7),
+                ("October 2026 — Commercial Launch", "HGM Ventures",
+                 "Align entity-wide launch activities per Business Plan v6.", "Oct 2026", "launch", "todo", 8),
+                ("October 2026 — Commercial Launch", "Entity Structure Memo v6",
+                 "Confirm it reflects the final launch structure across all entities.", "Oct 2026", "legal", "todo", 9),
+                # ── November 2026 — Farm Stand ──
+                ("November 2026 — Farm Stand", "Farm stand launch",
+                 "Timed to harvest readiness — finalize name decision (Drigo's vs. alternative).",
+                 "Nov 2026", "farm-stand", "todo", 10),
+                ("November 2026 — Farm Stand", "Signage, staffing & POS setup",
+                 "Confirm ahead of launch.", "Nov 2026", "farm-stand", "todo", 11),
+                ("November 2026 — Farm Stand", "Juice bar coordination",
+                 "Coordinate with juice bar structure if Home Depot grant funds materialize in time.",
+                 "Nov 2026", "farm-stand", "todo", 12),
+                # ── Ongoing / no fixed deadline ──
+                ("Ongoing / No Fixed Deadline", "Recognition & Attribution clause",
+                 "Roll out across all active/new UGW consulting contracts.", "Ongoing", "legal", "in-progress", 13),
+                ("Ongoing / No Fixed Deadline", "Resilient Kids curriculum",
+                 "Pursue district-level adoption conversations.", "Ongoing", "program", "todo", 14),
+                ("Ongoing / No Fixed Deadline", "St. Rose of Lima school garden",
+                 "Monitor implementation against the $10,000 budget plan.", "Ongoing", "program", "in-progress", 15),
+                ("Ongoing / No Fixed Deadline", "Merged operating budget workbook",
+                 "Keep reconciled as nonprofit/LLC financials evolve; revisit paid-intern staffing model (FIU/UM/MDC) as programs scale.",
+                 "Ongoing", "ongoing", "in-progress", 16),
+                ("Ongoing / No Fixed Deadline", "Chicken incubation",
+                 "Ongoing personal project, no external deadline.", "Ongoing", "ongoing", "in-progress", 17),
+                ("Ongoing / No Fixed Deadline", "The Embodied TimeMap",
+                 "Maintain Excel/HTML versions in parallel as needed.", "Ongoing", "ongoing", "in-progress", 18),
+            ],
+        )
+
+    # Seed CSA orders + prices from the bundled Farmhand export (idempotent).
+    if c.execute("SELECT COUNT(*) FROM csa_orders").fetchone()[0] == 0:
+        try:
+            import csa_seed
+            c.executemany(
+                "INSERT INTO csa_orders (order_date, month, customer, email, phone, "
+                "location, zone, dietary, status, items) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                [(o["date"], o["month"], o["name"], o["email"], o["phone"],
+                  o["location"], o["zone"], o["dietary"], o["status"],
+                  json.dumps(o["items"])) for o in csa_seed.CSA_ORDERS],
+            )
+            if c.execute("SELECT COUNT(*) FROM csa_prices").fetchone()[0] == 0:
+                c.executemany("INSERT INTO csa_prices (item, price) VALUES (?,?) "
+                              "ON CONFLICT(item) DO NOTHING",
+                              list(csa_seed.DEFAULT_PRICES.items()))
+        except Exception as e:
+            print(f"[csa] could not seed CSA orders: {e}")
+
     conn.commit()
-    seed(conn)
     conn.close()
 
 
-def migrate_columns(c):
-    """Add columns that were introduced after an existing DB was created.
-    CREATE TABLE IF NOT EXISTS never alters an existing table, so new columns
-    in the registry (e.g. tasks.priority) are backfilled here — non-destructive."""
-    for name, spec in TABLES.items():
-        have = {r[1] for r in c.execute(f"PRAGMA table_info({name})")}
-        if not have:
-            continue  # table will be created fresh above
-        for col, t in spec["cols"].items():
-            if col not in have:
-                c.execute(f"ALTER TABLE {name} ADD COLUMN {col} {coldef(t)}")
+def csa_analytics(conn):
+    """Aggregate CSA orders into the numbers the dashboard shows."""
+    orders = []
+    for r in conn.execute("SELECT * FROM csa_orders ORDER BY order_date, id"):
+        d = dict(r)
+        try:
+            d["items_map"] = json.loads(d.get("items") or "{}")
+        except (ValueError, TypeError):
+            d["items_map"] = {}
+        orders.append(d)
+    prices = {r["item"]: r["price"] for r in conn.execute("SELECT * FROM csa_prices")}
 
+    share_items = ["Small Farm Box", "Regular Farm Share", "Small Fruit Box"]
+    share_counts = {s: 0 for s in share_items}
+    item_units = {}
+    per_customer = {}
+    monthly = {}          # month -> {orders, units, revenue}
+    total_units = 0
+    total_revenue = 0.0
 
-def seed(conn):
-    c = conn.cursor()
+    for o in orders:
+        cust = (o.get("email") or o.get("customer") or "").strip().lower()
+        per_customer[cust] = per_customer.get(cust, 0) + 1
+        order_units = 0
+        order_rev = 0.0
+        for item, qty in o["items_map"].items():
+            qty = qty or 0
+            item_units[item] = item_units.get(item, 0) + qty
+            if item in share_counts:
+                share_counts[item] += qty
+            order_units += qty
+            order_rev += qty * prices.get(item, 0)
+        total_units += order_units
+        total_revenue += order_rev
+        m = o.get("month") or "unknown"
+        mm = monthly.setdefault(m, {"month": m, "orders": 0, "units": 0, "revenue": 0.0})
+        mm["orders"] += 1
+        mm["units"] += order_units
+        mm["revenue"] += order_rev
 
-    def empty(t):
-        return c.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] == 0
+    monthly_list = [monthly[k] for k in sorted(monthly)]
+    unique = len([c for c in per_customer if c])
+    repeat = len([c for c, n in per_customer.items() if c and n > 1])
+    most_popular = max(share_counts, key=share_counts.get) if any(share_counts.values()) else "—"
 
-    # ── Crops — REAL harvest data aggregated from the UGW harvest logs (2023–25).
-    #    yield_lbs and the monthly crop_yield series below come straight from the
-    #    logs, so the dashboard reflects what the farm actually harvested.
-    if empty("crops"):
-        c.executemany(
-            "INSERT INTO crops (id,name,type,beds,status,yield_lbs,cost,price,nutrition,culture,herbal,notes) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            [
-                ("PAPA", "Papaya", "Tree Fruit", 4, "on-track", 644.7, 0.40, 2.50,
-                 "Vitamin C, vitamin A, folate, fiber, and the enzyme papain.",
-                 "A Caribbean favorite eaten ripe or green in salads and stews.",
-                 "Papain aids digestion; leaves are brewed traditionally as a tonic.",
-                 "Top harvest crop by weight — heaviest in Nov–Dec."),
-                ("COLL", "Collard", "Leafy Green", 8, "at-risk", 358.2, 0.45, 3.25,
-                 "Excellent source of vitamins K, A, C and calcium.",
-                 "Cornerstone of Southern and Black American foodways.",
-                 "Supports bone and heart health; nutrient-dense cool-season green.",
-                 "Reliable year-round producer; scout for aphids."),
-                ("MANG", "Mango", "Tree Fruit", 3, "on-track", 265.5, 0.50, 3.00,
-                 "Rich in vitamins A and C, fiber and antioxidants.",
-                 "The taste of Caribbean summer — eaten fresh and in juices.",
-                 "Leaf and bark infusions used in folk remedies.",
-                 "Strong May–June flush from the orchard trees."),
-                ("CUCU", "Cucumber", "Vine", 5, "on-track", 225.5, 0.40, 2.75,
-                 "Very hydrating; vitamin K and low calorie.",
-                 "A cooling staple in salads and farm-stand boxes.",
-                 "Soothing for skin and digestion.",
-                 "Heavy producer on the trellis in the warm months."),
-                ("BELL", "Bell Pepper", "Fruiting", 5, "on-track", 187.5, 0.60, 4.50,
-                 "Loaded with vitamin C and A and antioxidants.",
-                 "The colorful base of sofrito and stews.",
-                 "Carotenoids studied for anti-inflammatory benefits.",
-                 "High-value CSA crop; peaks in autumn."),
-                ("CABB", "Cabbage", "Leafy Green", 6, "on-track", 175.0, 0.35, 2.25,
-                 "Good source of vitamin C, vitamin K and fiber.",
-                 "Stewed cabbage is a Caribbean side-dish staple.",
-                 "Gut-supportive; traditional poultice green.",
-                 "Stores well; steady cool-season yields."),
-                ("PAKC", "Pak Choi", "Leafy Green", 6, "on-track", 137.0, 0.50, 3.50,
-                 "Vitamins A, C and K plus calcium.",
-                 "A stir-fry green bridging Caribbean and Asian kitchens.",
-                 "Supports bone health; quick-growing.",
-                 "Fast cut-and-come-again crop; strong winter flush."),
-                ("CARR", "Carrot", "Root", 5, "on-track", 131.6, 0.40, 2.50,
-                 "Beta-carotene, fiber and potassium.",
-                 "Grated into slaws and pressed for fresh juice.",
-                 "Supports eye health.",
-                 "Long-season root; best May–June pulls."),
-                ("PUMP", "Pumpkin", "Vine / Squash", 4, "on-track", 129.5, 0.30, 2.00,
-                 "Beta-carotene, potassium and fiber.",
-                 "The heart of Caribbean pumpkin soup.",
-                 "Seeds are nutrient-dense; flesh is soothing.",
-                 "Sprawling vines; stores for months after harvest."),
-                ("LETT", "Lettuce", "Leafy Green", 5, "complete", 116.9, 0.45, 3.25,
-                 "Folate, vitamin A and hydration.",
-                 "The fresh salad base for the farm stand.",
-                 "Light and cooling.",
-                 "Cool-season crop; main flush Jan and May."),
-                ("EGGP", "Eggplant", "Fruiting", 4, "on-track", 104.8, 0.50, 3.50,
-                 "Fiber and antioxidants (nasunin in the skin).",
-                 "Asian eggplant featured in curries and stews.",
-                 "Supports heart health.",
-                 "Productive across the warm and shoulder months."),
-                ("FENN", "Fennel", "Herb / Bulb", 3, "on-track", 104.5, 0.55, 4.00,
-                 "Vitamin C, fiber and the aromatic compound anethole.",
-                 "Aromatic bulb and fronds used in salads and braises.",
-                 "Traditional digestive aid.",
-                 "Concentrated spring harvest (big May pull)."),
-            ],
-        )
-
-    if empty("crop_yield"):
-        # Real monthly seasonality (calendar month, summed across 2023–25 logs).
-        series = {
-            "PAPA": [20.6, 19.8, 0, 0, 41.2, 111.5, 0, 0, 0, 30.2, 153.0, 268.4],
-            "COLL": [23.0, 5.0, 8.8, 0, 68.0, 101.0, 0, 0, 0, 0, 50.5, 101.8],
-            "MANG": [0, 0, 0, 0, 30.0, 163.5, 0, 0, 0, 0, 72.0, 0],
-            "CUCU": [0.8, 1.2, 0, 0, 31.5, 19.5, 0, 0, 0, 0, 132.5, 40.0],
-            "BELL": [0, 0, 0, 0, 31.5, 32.0, 0, 0, 0, 0, 104.0, 20.0],
-            "CABB": [0, 0, 0, 0, 26.0, 61.5, 0, 0, 0, 0, 87.5, 0],
-            "PAKC": [67.1, 6.7, 13.9, 0, 0, 0, 0, 0, 0, 0, 0, 49.2],
-            "CARR": [1.0, 5.6, 0, 0, 50.0, 75.0, 0, 0, 0, 0, 0, 0],
-            "PUMP": [0, 0, 0, 0, 72.0, 20.0, 0, 0, 0, 0, 7.5, 30.0],
-            "LETT": [38.1, 1.8, 0, 0, 77.0, 0, 0, 0, 0, 0, 0, 0],
-            "EGGP": [6.4, 9.9, 12.3, 0, 0, 14.5, 0, 0, 0, 0, 24.0, 37.7],
-            "FENN": [0, 2.5, 0, 0, 102.0, 0, 0, 0, 0, 0, 0, 0],
-        }
-        c.executemany(
-            "INSERT INTO crop_yield (crop_id,month,lbs) VALUES (?,?,?)",
-            [(cid, m + 1, lbs) for cid, row in series.items()
-             for m, lbs in enumerate(row)],
-        )
-
-    if empty("beds"):
-        c.executemany(
-            "INSERT INTO beds (id,name,crop_id,size_sqft,status,x_pct,y_pct) VALUES (?,?,?,?,?,?,?)",
-            [
-                ("B1", "North Bed 1",  "COLL", 200, "at-risk",  22, 28),
-                ("B2", "North Bed 2",  "LETT", 120, "complete", 40, 24),
-                ("B3", "Trellis Row",  "CUCU", 110, "on-track", 64, 38),
-                ("B4", "Pepper Row",   "BELL", 90,  "on-track", 30, 60),
-                ("B5", "Orchard",      "PAPA", 260, "on-track", 70, 66),
-                ("B6", "Squash Patch", "PUMP", 180, "on-track", 52, 50),
-                ("B7", "Root Field",   "CARR", 140, "on-track", 82, 30),
-            ],
-        )
-
-    if empty("sustainability"):
-        c.executemany(
-            "INSERT INTO sustainability (metric,label,value,unit,benchmark,note) VALUES (?,?,?,?,?,?)",
-            [
-                ("carbon",  "Carbon Sequestered", 3.8,  "tons CO₂e", 4.5, "Soil + biomass estimate, YTD"),
-                ("water",   "Water Used",         62000, "gallons",  90000, "Drip irrigation + rainfall"),
-                ("rainwater", "Rainwater Harvested", 18000, "gallons", 15000, "Cistern capture"),
-                ("solar",   "Solar Generation",   5400, "kWh",       5000, "Rooftop array, YTD"),
-                ("compost", "Compost Produced",   12500, "lbs",      10000, "On-site closed loop"),
-                ("soil_health", "Soil Health Score", 7.6, "/ 10",     8.0, "Avg organic-matter index"),
-                ("soil_moisture", "Soil Moisture", 44,   "% VWC",     45, "Target band 35–50%"),
-            ],
-        )
-
-    if empty("community"):
-        c.executemany(
-            "INSERT INTO community (metric,label,value,unit,goal,period) VALUES (?,?,?,?,?,?)",
-            [
-                ("donated",   "Produce Donated",    2100, "lbs",   3000, "YTD"),
-                ("families",  "Families Served",     185, "households", 250, "YTD"),
-                ("volunteer", "Volunteer Hours",    1340, "hours", 1500, "YTD"),
-                ("csa",       "CSA Shares Filled",    48, "shares", 60,  "Current season"),
-                ("market",    "Farm-Stand Revenue", 9600, "USD",  12000, "YTD"),
-                ("workshops", "Education Workshops",   16, "sessions", 20, "YTD"),
-            ],
-        )
-
-    if empty("people"):
-        c.executemany(
-            "INSERT INTO people (name,role,phone,email,active,notes) VALUES (?,?,?,?,?,?)",
-            [
-                ("Director", "employee", "", "", 1, "Executive Director — grants & partnerships"),
-                ("Farm Manager", "employee", "", "", 1, "Day-to-day growing operations"),
-                ("Volunteer Crew", "volunteer", "", "", 1, "Rotating weekend volunteers"),
-                ("Intern", "intern", "", "", 1, "Seasonal data & field intern"),
-            ],
-        )
-
-    if empty("tasks"):
-        c.executemany(
-            "INSERT INTO tasks (title,assignee,role,type,priority,start,due,status,notes) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
-            [
-                ("Submit USDA mid-year grant report", "Director", "employee", "grant", "high", "2026-06-15", "2026-06-30", "active", "Attach yield + impact data"),
-                ("Scout collard beds for aphids", "Volunteer Crew", "volunteer", "task", "high", "2026-06-18", "2026-06-20", "active", "B2 flagged at-risk"),
-                ("Order drip-line fittings", "Farm Manager", "employee", "purchase", "medium", "2026-06-20", "2026-06-24", "pending", "Replace cracked Pepper Row line"),
-                ("Log weekly harvest weights", "Intern", "intern", "task", "medium", "2026-06-16", "2026-06-21", "active", "Enter into harvest log spreadsheet"),
-                ("Harvest & dry sorrel calyces", "Volunteer Crew", "volunteer", "task", "low", "2026-09-10", "2026-09-15", "pending", "For holiday sorrel demand"),
-                ("Renew Comb Cutters MOU", "Director", "employee", "todo", "medium", "2026-07-01", "2026-07-10", "pending", "On-site beekeeping partner"),
-                ("Plant fall collard succession", "Farm Manager", "employee", "task", "medium", "2026-07-25", "2026-08-01", "pending", "Beds B2, B8"),
-                ("Carbon-credit documentation packet", "Director", "employee", "grant", "high", "2026-09-15", "2026-10-01", "pending", "Record-keeping for credits"),
-            ],
-        )
-
-    if empty("budget"):
-        c.executemany(
-            "INSERT INTO budget (category,allocated,spent) VALUES (?,?,?)",
-            [
-                ("Seeds & Seedlings", 8000, 5200),
-                ("Soil & Compost",    6000, 4100),
-                ("Irrigation",        9000, 6400),
-                ("Tools & Equipment", 7000, 5900),
-                ("Staff & Stipends", 42000, 28500),
-                ("Education & CSA",  12000, 7300),
-            ],
-        )
-
-    if empty("milestones"):
-        c.executemany(
-            "INSERT INTO milestones (label,date,state) VALUES (?,?,?)",
-            [
-                ("Grant Awarded",         "Jan 2026", "done"),
-                ("Spring Planting",       "Mar 2026", "done"),
-                ("CSA Season Launch",     "May 2026", "done"),
-                ("Mid-Year Grant Report", "Jun 2026", "active"),
-                ("Fall Harvest & Sorrel", "Oct 2026", "pending"),
-                ("Carbon-Credit Filing",  "Dec 2026", "pending"),
-            ],
-        )
-
-    if empty("inputs"):
-        c.executemany(
-            "INSERT INTO inputs (name,applied,benchmark) VALUES (?,?,?)",
-            [
-                ("Compost (lbs/bed)",   120, 100),
-                ("Worm Castings",        18,  20),
-                ("Fish Emulsion (oz)",   24,  28),
-                ("Neem (oz)",             6,   8),
-                ("Mulch (cu ft)",        40,  45),
-            ],
-        )
-
-    # ── Pesticide / biopesticide program — from the real spray log (2023–26) ──
-    #    Chemical health & environmental cards summarize EPA + NPIC primary
-    #    sources; the log + aggregates come from UGW.pesticide.application.log.
-    if empty("chemicals"):
-        c.executemany(
-            "INSERT INTO chemicals (id,name,active,ptype,origin,omri,targets,applications,"
-            "caution,health,environment,pollinators,aquatic,sources) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            [(ch["id"], ch["name"], ch["active"], ch["ptype"], ch["origin"], ch["omri"],
-              ch["targets"], ch.get("applications", 0), ch["caution"], ch["health"],
-              ch["environment"], ch["pollinators"], ch["aquatic"], json.dumps(ch["sources"]))
-             for ch in pesticide_data.CHEMICALS],
-        )
-    if empty("pesticide_log"):
-        c.executemany(
-            "INSERT INTO pesticide_log (date,crop,bed,pest,scale,product,chemicals,dosage,notes) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
-            [(r["date"], r["crop"], r["bed"], r["pest"], r["scale"], r["product"],
-              r["chemicals"], r["dosage"], r["notes"]) for r in pesticide_data.PESTICIDE_LOG],
-        )
-    if empty("pest_pressure"):
-        c.executemany(
-            "INSERT INTO pest_pressure (pest,applications,avg_scale) VALUES (?,?,?)",
-            [(p["pest"], p["applications"], p["avg_scale"]) for p in pesticide_data.PEST_PRESSURE],
-        )
-    if empty("pesticide_annual"):
-        c.executemany(
-            "INSERT INTO pesticide_annual (year,applications) VALUES (?,?)",
-            [(a["year"], a["applications"]) for a in pesticide_data.PESTICIDE_ANNUAL],
-        )
-
-    # ── Livestock — egg production + chicken program (2026 logs) ──────────────
-    if empty("eggs"):
-        c.executemany(
-            "INSERT INTO eggs (date,flock,total,brown,other,feed,staff) VALUES (?,?,?,?,?,?,?)",
-            [(e["date"], e["flock"], e["total"], e["brown"], e["other"], e["feed"], e["staff"])
-             for e in livestock_data.EGGS],
-        )
-    if empty("eggs_monthly"):
-        c.executemany(
-            "INSERT INTO eggs_monthly (month,label,total,brown,other,avg_per_day) VALUES (?,?,?,?,?,?)",
-            [(m["month"], m["label"], m["total"], m["brown"], m["other"], m["avg_per_day"])
-             for m in livestock_data.EGGS_MONTHLY],
-        )
-    if empty("livestock_costs"):
-        c.executemany(
-            "INSERT INTO livestock_costs (date,item,cost,store,flock) VALUES (?,?,?,?,?)",
-            [(x["date"], x["item"], x["cost"], x["store"], x["flock"])
-             for x in livestock_data.LIVESTOCK_COSTS],
-        )
-    if empty("chicken_sourcing"):
-        c.executemany(
-            "INSERT INTO chicken_sourcing (product,brand,supplier,notes) VALUES (?,?,?,?)",
-            [(s["product"], s["brand"], s["where"], s["notes"])
-             for s in livestock_data.CHICKEN_SOURCING],
-        )
-
-    if empty("partners"):
-        c.executemany(
-            "INSERT INTO partners (name,type,contact,contribution,notes) VALUES (?,?,?,?,?)",
-            [
-                ("Comb Cutters", "Beekeeping", "hello@combcutters.org", "On-site hives + pollination", "Honey sold at farm stand"),
-                ("Liberty City Mutual Aid", "Food Distribution", "—", "Weekly produce box pickup", "Reaches 60+ households"),
-                ("Roots Collective Farm", "Partner Farm", "—", "Shared seedling starts", "Different growing micro-zone"),
-                ("Barry University", "Education / Research", "—", "Student volunteers & data support", "Analytics partnership"),
-            ],
-        )
-
-    if empty("settings"):
-        c.executemany(
-            "INSERT INTO settings (key,value) VALUES (?,?)",
-            [("grant_total", 84000), ("season_year", 2026)],
-        )
-
-    if empty("sheets"):
-        c.executemany(
-            "INSERT INTO sheets (target_table,csv_url,enabled,last_synced,last_status) VALUES (?,?,?,?,?)",
-            [
-                ("crops",          "", 0, "", "Not configured"),
-                ("crop_yield",     "", 0, "", "Not configured"),
-                ("sustainability", "", 0, "", "Not configured"),
-                ("community",      "", 0, "", "Not configured"),
-                ("tasks",          "", 0, "", "Not configured"),
-            ],
-        )
-
-    # ── Soil composition — from the 3 attached reports ───────────────────────
-    # FL DEP residential SCTL / EPA limits used as the "threshold" reference.
-    if empty("soil_tests"):
-        c.executemany(
-            "INSERT INTO soil_tests (site,analyte,value,unit,threshold,test_date,lab) VALUES (?,?,?,?,?,?,?)",
-            [
-                # AEL full heavy-metal panel — "Soil From Community Garden" (Workorder M1802425)
-                ("Community Garden (AEL)", "Lead",        94.0,  "mg/kg", 400.0, "2018-06-21", "Advanced Environmental Labs"),
-                ("Community Garden (AEL)", "Arsenic",     2.2,   "mg/kg", 2.1,   "2018-06-21", "Advanced Environmental Labs"),
-                ("Community Garden (AEL)", "Cadmium",     0.94,  "mg/kg", 82.0,  "2018-06-21", "Advanced Environmental Labs"),
-                ("Community Garden (AEL)", "Chromium",    9.6,   "mg/kg", 210.0, "2018-06-21", "Advanced Environmental Labs"),
-                ("Community Garden (AEL)", "Cobalt",      0.68,  "mg/kg", 1700.0,"2018-06-21", "Advanced Environmental Labs"),
-                ("Community Garden (AEL)", "Copper",      37.0,  "mg/kg", 150.0, "2018-06-21", "Advanced Environmental Labs"),
-                ("Community Garden (AEL)", "Mercury",     0.13,  "mg/kg", 3.0,   "2018-06-21", "Advanced Environmental Labs"),
-                ("Community Garden (AEL)", "Moisture",    29.0,  "%",     0.0,   "2018-06-21", "Advanced Environmental Labs"),
-                # Barry University Dept. of Physical Sciences — lead + pH across 3 UGW gardens
-                ("Garden 1 (1613 NW 54th St)", "Lead", 190.0, "ppm", 400.0, "2019-01-01", "Barry University"),
-                ("Garden 1 (1613 NW 54th St)", "pH",   6.91,  "pH",  0.0,   "2019-01-01", "Barry University"),
-                ("Garden 2 (1590 NW 54th St)", "Lead", 91.0,  "ppm", 400.0, "2019-01-01", "Barry University"),
-                ("Garden 2 (1590 NW 54th St)", "pH",   7.11,  "pH",  0.0,   "2019-01-01", "Barry University"),
-                ("Garden 3 (Brownsville)",     "Lead", 44.0,  "ppm", 400.0, "2019-01-01", "Barry University"),
-                ("Garden 3 (Brownsville)",     "pH",   7.38,  "pH",  0.0,   "2019-01-01", "Barry University"),
-                ("Control (Barry Miami Shores)", "Lead", 28.0, "ppm", 400.0, "2019-01-01", "Barry University"),
-                ("Control (Barry Miami Shores)", "pH",   7.32, "pH",  0.0,   "2019-01-01", "Barry University"),
-                # Remediation report — Little Haiti baseline before regenerative remediation
-                ("Little Haiti (pre-remediation)", "Lead", 1200.0, "ppm", 400.0, "2010-01-01", "Remediation Protocol"),
-                ("Little Haiti (post-remediation)", "Lead", 0.0,  "ppm", 400.0, "2011-01-01", "Yale University"),
-            ],
-        )
-
-    # ── Crop tracking — aggregated from the seeding + harvest logs (2023–2025) ─
-    if empty("crop_log"):
-        c.executemany(
-            "INSERT INTO crop_log (crop,seedlings,trays,harvested,germ) VALUES (?,?,?,?,?)",
-            [
-                ("Papaya", 384, 6, 644.7, 76),  ("Collard", 140, 4, 358.2, 62),
-                ("Mango", 0, 0, 265.5, 76),     ("Cucumber", 1450, 42, 225.5, 100),
-                ("Bell Pepper", 20, 12, 187.5, 90), ("Cabbage", 310, 6, 175.0, 76),
-                ("Pak Choi", 2408, 58, 137.0, 66), ("Carrot", 3825, 16, 131.6, 100),
-                ("Pumpkin", 0, 0, 129.5, 76),   ("Lettuce", 2220, 46, 116.9, 36),
-                ("Eggplant", 122, 16, 104.8, 83), ("Fennel", 382, 5, 104.5, 65),
-                ("Tomato", 140, 12, 99.6, 100), ("Banana", 0, 0, 69.2, 76),
-                ("Swiss Chard", 600, 22, 66.5, 100), ("Cauliflower", 1200, 36, 52.3, 100),
-                ("Arugula", 0, 15, 51.6, 57),   ("Broccoli", 600, 18, 43.3, 72),
-                ("Radish", 2626, 24, 38.0, 100), ("Okra", 0, 0, 38.5, 76),
-                ("Kale", 360, 13, 32.0, 100),   ("Herbs", 1575, 36, 0.0, 76),
-            ],
-        )
-
-    if empty("harvest_trend"):
-        c.executemany(
-            "INSERT INTO harvest_trend (period,units) VALUES (?,?)",
-            [
-                ("2023-10", 89.5), ("2023-12", 177.4), ("2024-01", 259.6),
-                ("2024-02", 150.2), ("2024-03", 104.0), ("2024-05", 782.2),
-                ("2024-06", 785.5), ("2024-11", 693.0), ("2024-12", 537.0),
-            ],
-        )
-
-    # ── Miami weather — monthly climate normals (NOAA-style) for overlay ─────
-    if empty("weather"):
-        # month, label, rainfall_in, temp_avg_f, temp_high_f, note
-        wx = [
-            (1,  "Jan", 1.6, 68, 76, "Dry season — cool, low rainfall."),
-            (2,  "Feb", 2.2, 69, 78, "Dry season; good for greens."),
-            (3,  "Mar", 3.0, 72, 80, "Warming up; irrigation matters."),
-            (4,  "Apr", 3.1, 76, 83, "End of dry season."),
-            (5,  "May", 5.3, 80, 87, "Wet season begins — growth accelerates."),
-            (6,  "Jun", 9.7, 82, 89, "Heavy rains; hurricane season opens Jun 1."),
-            (7,  "Jul", 6.5, 84, 91, "Hot and humid; afternoon storms."),
-            (8,  "Aug", 8.9, 84, 91, "Peak heat; watch for flooding."),
-            (9,  "Sep", 9.8, 83, 89, "Wettest month; hurricane peak."),
-            (10, "Oct", 6.3, 80, 86, "Wet season winding down; king tides."),
-            (11, "Nov", 3.3, 75, 82, "Dry season returns; big fall harvest."),
-            (12, "Dec", 2.3, 70, 78, "Cool and dry; holiday demand."),
-        ]
-        c.executemany(
-            "INSERT INTO weather (month,label,rainfall_in,temp_avg_f,temp_high_f,note) VALUES (?,?,?,?,?,?)",
-            wx)
-
-    if empty("weather_alerts"):
-        c.executemany(
-            "INSERT INTO weather_alerts (type,severity,date,title,note,active) VALUES (?,?,?,?,?,?)",
-            [
-                ("hurricane", "watch", "2026-06-01", "Atlantic hurricane season (Jun 1 – Nov 30)",
-                 "Peak Aug–Oct. Keep a harvest-early plan; secure shade cloth, trellises and seedling trays.", 1),
-                ("heat", "advisory", "2026-06-20", "Extreme heat advisory",
-                 "Heat index over 100°F. Water beds at dawn and shade tender greens (lettuce, pak choi).", 1),
-                ("flood", "watch", "2026-06-15", "Wet-season heavy-rain flooding",
-                 "Downpours and king tides pool in low beds. Clear drainage and raise trays off the ground.", 1),
-                ("drought", "advisory", "2026-03-01", "Dry-season moisture deficit",
-                 "Nov–Apr dry spell. Increase drip irrigation and mulch to hold soil moisture.", 0),
-                ("frost", "info", "2026-01-10", "Rare cold snap",
-                 "South Florida frost is uncommon but possible. Cover tender crops if temps approach 40°F.", 0),
-            ],
-        )
-
-    # ── Data roadmap — future assets to integrate (editable suggestions) ─────
-    if empty("roadmap"):
-        c.executemany(
-            "INSERT INTO roadmap (name,category,status,note) VALUES (?,?,?,?)",
-            [
-                ("Carbon soil testing", "Sustainability", "idea",
-                 "Lab CO₂ / organic-matter panels to quantify sequestration for carbon-credit programs."),
-                ("CSA impacts", "Community Impact", "idea",
-                 "Track CSA shares, member retention, and food-access outcomes over time."),
-                ("CSA order hub", "Community Impact", "idea",
-                 "Bring the currently-outsourced CSA ordering in-house: orders, pickups, payments."),
-                ("Solar output", "Sustainability", "idea",
-                 "Daily kWh from the rooftop array (live meter feed or monthly bill import)."),
-                ("Water usage", "Sustainability", "idea",
-                 "Irrigation draw + rainwater capture, broken out by bed or zone."),
-                ("Calendar of events", "Operations", "idea",
-                 "Workshops, volunteer days, market dates, and planned harvest windows."),
-                ("Task tracker", "Operations", "live",
-                 "Already on the dashboard — the Tasks & Deadlines widget."),
-                ("Organic certification progress", "Certification", "idea",
-                 "Checklist + milestones toward USDA Organic / regenerative certification."),
-                ("Comb Cutters hive data", "Partners", "planned",
-                 "Honey yield and pollination metrics from the on-site beekeeping partner."),
-                ("Weather & growing-degree days", "Crops & Yield", "idea",
-                 "Log conditions to correlate with harvest outputs and refine planting."),
-            ],
-        )
-
-    if empty("widgets"):
-        seed_widgets(c)
-    else:
-        backfill_defaults(c)
-
-    conn.commit()
-
-
-def default_widgets():
-    """Full default dashboard layout. `config` is JSON; `maximize` describes the
-    customizable expanded view (e.g. per-crop yield + nutrition + culture)."""
-    return [
-        # title, type, category, source, config, position, minimized
-        ("Total Harvest (YTD)", "kpi", "Overview", "kpi:total_yield",
-         {"unit": "lbs", "sub": "kpi:harvest_sub"}, 0, 0),
-        ("Families Served", "kpi", "Overview", "kpi:families",
-         {"unit": "households", "sub": "kpi:families_sub"}, 1, 0),
-        ("Grant Utilization", "kpi", "Overview", "kpi:utilization_pct",
-         {"unit": "%", "sub": "kpi:grant_sub"}, 2, 0),
-        ("CO₂ Sequestered", "kpi", "Overview", "kpi:carbon",
-         {"unit": "tons", "sub": "kpi:carbon_sub"}, 3, 0),
-
-        ("Monthly Harvest by Crop", "line", "Crops & Yield", "crop_yield",
-         {"span": 2, "y": "lbs"}, 4, 0),
-        ("Crop Status & Profit", "table", "Crops & Yield", "crops",
-         {"span": 2,
-          "columns": ["name", "type", "beds", "yield_lbs", "margin", "status"],
-          "maximize": {"detail": "crop",
-                       "panels": ["yield_chart", "nutrition", "culture", "herbal", "economics"]}},
-         5, 0),
-        ("Harvest Share by Crop", "doughnut", "Crops & Yield", "crops",
-         {"span": 2, "value": "yield_lbs", "label": "name"}, 6, 0),
-        ("Plant Library", "library", "Crops & Yield", "crops",
-         {"span": 2,
-          "maximize": {"detail": "crop", "panels": ["nutrition", "culture", "herbal"]}},
-         7, 0),
-
-        ("Growing Map", "map", "Crops & Yield", "beds", {"span": 2}, 8, 0),
-
-        ("Sustainability vs Benchmark", "bar", "Sustainability", "sustainability",
-         {"span": 2, "value": "value", "compare": "benchmark", "label": "label", "horizontal": True}, 9, 0),
-        ("Soil Moisture", "gauge", "Sustainability", "sustain:soil_moisture",
-         {"max": 100, "unit": "% VWC", "target": "35–50%"}, 10, 0),
-        ("Inputs & Compost", "bar", "Sustainability", "inputs",
-         {"value": "applied", "compare": "benchmark", "label": "name", "horizontal": True}, 11, 0),
-
-        ("Community Impact", "progress", "Community Impact", "community",
-         {"span": 2, "value": "value", "goal": "goal", "label": "label"}, 12, 0),
-        ("Farm-Stand Revenue", "kpi", "Community Impact", "community:market",
-         {"unit": "USD", "money": True}, 13, 0),
-        ("Volunteer Hours", "kpi", "Community Impact", "community:volunteer",
-         {"unit": "hrs"}, 14, 0),
-
-        ("Tasks & Deadlines", "list", "Operations", "tasks", {"span": 2}, 15, 0),
-        ("Grant Milestones", "timeline", "Operations", "milestones", {"span": 2}, 16, 0),
-        ("Budget: Allocated vs Spent", "bar", "Operations", "budget",
-         {"span": 2, "value": "allocated", "compare": "spent", "label": "category", "money": True}, 17, 0),
-        ("Budget Progress", "progress", "Operations", "budget",
-         {"value": "spent", "goal": "allocated", "label": "category", "money": True}, 18, 0),
-
-        ("Community Partners", "list", "Partners", "partners", {"span": 2}, 19, 0),
-
-        # ── Crop tracking from the real seeding + harvest logs (2023–2025) ────
-        ("Harvested Since 2023", "kpi", "Overview", "kpi:log_harvest",
-         {"unit": "units", "sub": "kpi:log_sub"}, 20, 0),
-        ("Crop Tracking — Planted vs Harvested", "table", "Crops & Yield", "crop_log",
-         {"span": 2, "columns": ["crop", "seedlings", "trays", "harvested", "germ"]}, 21, 0),
-        ("Top Crops by Harvest (since 2023)", "bar", "Crops & Yield", "crop_log",
-         {"span": 2, "value": "harvested", "label": "crop", "horizontal": True, "limit": 12}, 22, 0),
-        ("Seedlings Planted by Crop", "bar", "Crops & Yield", "crop_log",
-         {"span": 2, "value": "seedlings", "label": "crop", "horizontal": True, "limit": 12}, 23, 0),
-        ("Monthly Harvest Trend (since 2023)", "line", "Crops & Yield", "harvest_trend",
-         {"span": 2, "x": "period", "y": "units"}, 24, 0),
-
-        # ── Soil composition from the 3 attached soil reports ────────────────
-        ("Soil Composition Tracking", "table", "Soil", "soil_tests",
-         {"span": 2, "columns": ["site", "analyte", "value", "unit", "threshold", "safety"]}, 25, 0),
-        ("Heavy Metals vs Safe Limit (AEL panel)", "bar", "Soil", "soil_tests",
-         {"span": 2, "value": "value", "compare": "threshold", "label": "analyte",
-          "horizontal": True, "filter": {"site": "Community Garden (AEL)"},
-          "exclude": {"analyte": ["Moisture"]}}, 26, 0),
-        ("Lead by Garden Site (vs 400 ppm toxic)", "bar", "Soil", "soil_tests",
-         {"span": 2, "value": "value", "label": "site", "horizontal": True,
-          "filter": {"analyte": "Lead"}}, 27, 0),
-        ("Soil pH by Garden", "bar", "Soil", "soil_tests",
-         {"span": 2, "value": "value", "label": "site", "horizontal": True,
-          "filter": {"analyte": "pH"}}, 28, 0),
-
-        # ── Weather (Miami) ──────────────────────────────────────────────────
-        ("Active Weather Alerts", "kpi", "Weather", "kpi:active_alerts",
-         {"unit": "active", "sub": "kpi:alerts_sub"}, 29, 0),
-        ("Weather Alerts", "list", "Weather", "weather_alerts", {"span": 2}, 30, 0),
-        ("Miami Rainfall vs Harvest", "climate", "Weather", "weather", {"span": 2}, 31, 0),
-
-        # ── Pest & spray management (from the real pesticide log, 2023–26) ────
-        ("Pest Applications Logged", "kpi", "Sustainability", "kpi:pest_apps",
-         {"unit": "applications", "sub": "kpi:pest_apps_sub"}, 32, 0),
-        ("Organic Program", "kpi", "Sustainability", "kpi:organic_share",
-         {"unit": "%", "sub": "kpi:organic_sub"}, 33, 0),
-        ("Products Used — Health & Safety", "chemicals", "Sustainability", "chemicals",
-         {"span": 2}, 34, 0),
-        ("Applications by Product", "bar", "Sustainability", "chemicals",
-         {"span": 2, "value": "applications", "label": "name", "horizontal": True,
-          "unit": "applications", "limit": 11}, 35, 0),
-        ("Pest Pressure (times treated)", "doughnut", "Sustainability", "pest_pressure",
-         {"span": 2, "value": "applications", "label": "pest", "unit": "applications"}, 36, 0),
-        ("Spray Applications by Year", "bar", "Sustainability", "pesticide_annual",
-         {"span": 2, "value": "applications", "label": "year", "unit": "applications"}, 37, 0),
-        ("Recent Pesticide Applications", "table", "Sustainability", "pesticide_log",
-         {"span": 2, "columns": ["date", "crop", "pest", "scale", "product"], "limit": 20}, 38, 0),
-
-        # ── Team & task tracker ──────────────────────────────────────────────
-        ("Team Roster", "list", "Operations", "people", {"span": 2}, 39, 0),
-
-        # ── Livestock — egg production + chicken program (2026 logs) ──────────
-        ("Eggs Collected (2026)", "kpi", "Livestock", "kpi:total_eggs",
-         {"unit": "eggs", "sub": "kpi:eggs_sub"}, 40, 0),
-        ("Chicken Program Spend", "kpi", "Livestock", "kpi:chicken_spend",
-         {"unit": "USD", "money": True, "sub": "kpi:chicken_spend_sub"}, 41, 0),
-        ("Eggs Collected by Month", "bar", "Livestock", "eggs_monthly",
-         {"span": 2, "value": "total", "label": "label", "unit": "eggs"}, 42, 0),
-        ("Egg Type Mix (Brown vs Easter-Egger)", "doughnut", "Livestock", "egg_types",
-         {"span": 2, "value": "value", "label": "label", "unit": "eggs"}, 43, 0),
-        ("Chicken Purchases", "table", "Livestock", "livestock_costs",
-         {"span": 2, "columns": ["date", "item", "cost", "store", "flock"]}, 44, 0),
-        ("Chicken Inputs & Suppliers", "list", "Livestock", "chicken_sourcing",
-         {"span": 2}, 45, 0),
-    ]
-
-
-def seed_widgets(c):
-    c.executemany(
-        "INSERT INTO widgets (title,type,category,source,config,position,minimized) "
-        "VALUES (?,?,?,?,?,?,?)",
-        [(t, ty, cat, src, json.dumps(cfg), pos, mn)
-         for t, ty, cat, src, cfg, pos, mn in default_widgets()],
-    )
-
-
-def backfill_defaults(c):
-    """Restore any missing default widgets (matched by title) so the dashboard
-    self-heals — widgets can no longer be permanently lost. User-added widgets
-    are left untouched."""
-    existing = {r[0] for r in c.execute("SELECT title FROM widgets")}
-    for t, ty, cat, src, cfg, pos, mn in default_widgets():
-        if t not in existing:
-            c.execute(
-                "INSERT INTO widgets (title,type,category,source,config,position,minimized) "
-                "VALUES (?,?,?,?,?,?,?)",
-                (t, ty, cat, src, json.dumps(cfg), pos, mn))
-    # keep the Soil pH widget legible (older DBs seeded it narrow & vertical)
-    c.execute("UPDATE widgets SET config=? WHERE title=? AND source='soil_tests'",
-              (json.dumps({"span": 2, "value": "value", "label": "site",
-                           "horizontal": True, "filter": {"analyte": "pH"}}),
-               "Soil pH by Garden"))
-    # Enrich tasks that predate the priority/role columns — fill NULLs only, so
-    # user edits are never overwritten (idempotent; existing DBs get a complete
-    # tracker without reseeding).
-    if "tasks" in {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}:
-        c.execute("UPDATE tasks SET priority='medium' WHERE priority IS NULL OR priority=''")
-        c.execute("UPDATE tasks SET role=CASE "
-                  "WHEN lower(assignee) LIKE '%volunteer%' THEN 'volunteer' "
-                  "WHEN lower(assignee) LIKE '%intern%' THEN 'intern' "
-                  "ELSE 'employee' END WHERE role IS NULL OR role=''")
-
-
-# Templates the user can add from the dashboard "+ Add Widget" menu.
-WIDGET_CATALOG = [
-    {"title": "Total Harvest (YTD)", "type": "kpi", "category": "Overview", "source": "kpi:total_yield",
-     "config": {"unit": "lbs", "sub": "kpi:harvest_sub"}},
-    {"title": "Grant Utilization", "type": "kpi", "category": "Overview", "source": "kpi:utilization_pct",
-     "config": {"unit": "%", "sub": "kpi:grant_sub"}},
-    {"title": "Monthly Harvest by Crop", "type": "line", "category": "Crops & Yield", "source": "crop_yield",
-     "config": {"span": 2, "y": "lbs"}},
-    {"title": "Crop Status & Profit", "type": "table", "category": "Crops & Yield", "source": "crops",
-     "config": {"span": 2, "columns": ["name", "type", "beds", "yield_lbs", "margin", "status"],
-                "maximize": {"detail": "crop", "panels": ["yield_chart", "nutrition", "culture", "herbal", "economics"]}}},
-    {"title": "Harvest Share by Crop", "type": "doughnut", "category": "Crops & Yield", "source": "crops",
-     "config": {"span": 2, "value": "yield_lbs", "label": "name"}},
-    {"title": "Plant Library", "type": "library", "category": "Crops & Yield", "source": "crops",
-     "config": {"span": 2, "maximize": {"detail": "crop", "panels": ["nutrition", "culture", "herbal"]}}},
-    {"title": "Growing Map", "type": "map", "category": "Crops & Yield", "source": "beds", "config": {"span": 2}},
-    {"title": "Sustainability vs Benchmark", "type": "bar", "category": "Sustainability", "source": "sustainability",
-     "config": {"span": 2, "value": "value", "compare": "benchmark", "label": "label", "horizontal": True}},
-    {"title": "Soil Moisture", "type": "gauge", "category": "Sustainability", "source": "sustain:soil_moisture",
-     "config": {"max": 100, "unit": "% VWC", "target": "35–50%"}},
-    {"title": "Community Impact", "type": "progress", "category": "Community Impact", "source": "community",
-     "config": {"span": 2, "value": "value", "goal": "goal", "label": "label"}},
-    {"title": "Tasks & Deadlines", "type": "list", "category": "Operations", "source": "tasks", "config": {"span": 2}},
-    {"title": "Grant Milestones", "type": "timeline", "category": "Operations", "source": "milestones", "config": {"span": 2}},
-    {"title": "Budget: Allocated vs Spent", "type": "bar", "category": "Operations", "source": "budget",
-     "config": {"span": 2, "value": "allocated", "compare": "spent", "label": "category", "money": True}},
-    {"title": "Community Partners", "type": "list", "category": "Partners", "source": "partners", "config": {"span": 2}},
-    {"title": "Crop Tracking — Planted vs Harvested", "type": "table", "category": "Crops & Yield", "source": "crop_log",
-     "config": {"span": 2, "columns": ["crop", "seedlings", "trays", "harvested", "germ"]}},
-    {"title": "Top Crops by Harvest (since 2023)", "type": "bar", "category": "Crops & Yield", "source": "crop_log",
-     "config": {"span": 2, "value": "harvested", "label": "crop", "horizontal": True, "limit": 12}},
-    {"title": "Seedlings Planted by Crop", "type": "bar", "category": "Crops & Yield", "source": "crop_log",
-     "config": {"span": 2, "value": "seedlings", "label": "crop", "horizontal": True, "limit": 12}},
-    {"title": "Monthly Harvest Trend (since 2023)", "type": "line", "category": "Crops & Yield", "source": "harvest_trend",
-     "config": {"span": 2, "x": "period", "y": "units"}},
-    {"title": "Soil Composition Tracking", "type": "table", "category": "Soil", "source": "soil_tests",
-     "config": {"span": 2, "columns": ["site", "analyte", "value", "unit", "threshold", "safety"]}},
-    {"title": "Heavy Metals vs Safe Limit (AEL panel)", "type": "bar", "category": "Soil", "source": "soil_tests",
-     "config": {"span": 2, "value": "value", "compare": "threshold", "label": "analyte", "horizontal": True,
-                "filter": {"site": "Community Garden (AEL)"}, "exclude": {"analyte": ["Moisture"]}}},
-    {"title": "Lead by Garden Site (vs 400 ppm toxic)", "type": "bar", "category": "Soil", "source": "soil_tests",
-     "config": {"span": 2, "value": "value", "label": "site", "horizontal": True, "filter": {"analyte": "Lead"}}},
-    {"title": "Soil pH by Garden", "type": "bar", "category": "Soil", "source": "soil_tests",
-     "config": {"span": 2, "value": "value", "label": "site", "horizontal": True, "filter": {"analyte": "pH"}}},
-    {"title": "Miami Rainfall vs Harvest", "type": "climate", "category": "Weather", "source": "weather",
-     "config": {"span": 2}},
-    {"title": "Weather Alerts", "type": "list", "category": "Weather", "source": "weather_alerts",
-     "config": {"span": 2}},
-    {"title": "Active Weather Alerts", "type": "kpi", "category": "Weather", "source": "kpi:active_alerts",
-     "config": {"unit": "active", "sub": "kpi:alerts_sub"}},
-]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Payload assembly
-# ─────────────────────────────────────────────────────────────────────────────
-def rows(conn, table, order=None):
-    q = f"SELECT * FROM {table}"
-    if order:
-        q += f" ORDER BY {order}"
-    out = [dict(r) for r in conn.execute(q)]
-    if table == "widgets":
-        for w in out:
-            try:
-                w["config"] = json.loads(w["config"]) if w["config"] else {}
-            except (TypeError, json.JSONDecodeError):
-                w["config"] = {}
-    return out
+    return {
+        "orders": orders,
+        "prices": prices,
+        "summary": {
+            "total_orders": len(orders),
+            "unique_customers": unique,
+            "repeat_customers": repeat,
+            "repeat_pct": round(repeat / unique * 100, 1) if unique else 0,
+            "share_counts": share_counts,
+            "most_popular_share": most_popular,
+            "item_units": item_units,
+            "total_units": total_units,
+            "grand_total_revenue": round(total_revenue, 2),
+            "monthly": monthly_list,
+            "date_range": (orders[0]["order_date"] if orders else "",
+                           orders[-1]["order_date"] if orders else ""),
+        },
+    }
 
 
 def dashboard_payload(conn):
-    crops = rows(conn, "crops", "name")
-    yld = rows(conn, "crop_yield")
-    sustain = {r["metric"]: r for r in rows(conn, "sustainability")}
-    community = {r["metric"]: r for r in rows(conn, "community")}
-    budget = rows(conn, "budget", "rowid")
+    plots = [dict(r) for r in conn.execute("SELECT * FROM plots ORDER BY id")]
+    budget = [dict(r) for r in conn.execute("SELECT * FROM budget ORDER BY rowid")]
+    milestones = [dict(r) for r in conn.execute("SELECT * FROM milestones ORDER BY id")]
+    inputs = [dict(r) for r in conn.execute("SELECT * FROM inputs ORDER BY rowid")]
+    settings = {r["key"]: r["value"] for r in conn.execute("SELECT * FROM settings")}
+    community = [dict(r) for r in conn.execute("SELECT * FROM community ORDER BY month")]
+    sustainability = [dict(r) for r in conn.execute("SELECT * FROM sustainability ORDER BY month")]
+    economics = [dict(r) for r in conn.execute("SELECT * FROM economics ORDER BY rowid")]
+    tasks = [dict(r) for r in conn.execute("SELECT * FROM tasks ORDER BY status, due")]
+    deadlines = [dict(r) for r in conn.execute("SELECT * FROM deadlines ORDER BY due")]
+    roadmap = [dict(r) for r in conn.execute("SELECT * FROM roadmap ORDER BY sort, id")]
+    widgets = [dict(r) for r in conn.execute("SELECT * FROM widgets ORDER BY sort")]
+    sheets = [dict(r) for r in conn.execute("SELECT * FROM sheet_sources ORDER BY target")]
 
     series = {}
-    for r in yld:
-        series.setdefault(r["crop_id"], [0] * 12)[r["month"] - 1] = r["lbs"]
-    # label series by crop name when available
-    name_by_id = {c["id"]: c["name"] for c in crops}
-    named_series = {name_by_id.get(cid, cid): row for cid, row in series.items()}
+    for r in conn.execute("SELECT month, crop, bushels FROM monthly_yield ORDER BY crop, month"):
+        series.setdefault(r["crop"], [0] * 12)[r["month"] - 1] = r["bushels"]
 
-    total_yield = sum(c["yield_lbs"] for c in crops)
     allocated = sum(b["allocated"] for b in budget)
     spent = sum(b["spent"] for b in budget)
-    settings = {r["key"]: r["value"] for r in rows(conn, "settings")}
-    grant_total = settings.get("grant_total") or allocated or 1
+    grant_total = settings.get("grant_total", allocated) or allocated
+    total_yield = sum(p["yield_bu"] for p in plots)
+    total_acres = sum(p["acres"] for p in plots)
+    status_counts = {}
+    for p in plots:
+        status_counts[p["status"]] = status_counts.get(p["status"], 0) + 1
+    active = sum(n for s, n in status_counts.items() if s in ("on-track", "at-risk"))
 
-    def cv(metric, key="value", default=0):
-        return (community.get(metric) or {}).get(key, default)
-
-    def sv(metric, key="value", default=0):
-        return (sustain.get(metric) or {}).get(key, default)
-
-    crop_log = rows(conn, "crop_log", "harvested DESC")
-    harvest_trend = rows(conn, "harvest_trend", "period")
-    soil_tests = rows(conn, "soil_tests", "rowid")
-    log_harvest = sum(r["harvested"] for r in crop_log)
-    seedlings_total = sum(r["seedlings"] for r in crop_log)
-    germ_vals = [r["germ"] for r in crop_log if r["germ"]]
-    germ_avg = round(sum(germ_vals) / len(germ_vals)) if germ_vals else 0
-    active_lead = [r for r in soil_tests
-                   if r["analyte"] == "Lead" and "remediation" not in r["site"].lower()]
-    lead_max = max((r["value"] for r in active_lead), default=0)
-    weather = rows(conn, "weather", "month")
-    weather_alerts = rows(conn, "weather_alerts", "active DESC, rowid")
-    active_alerts = sum(1 for a in weather_alerts if a["active"])
-
-    chemicals = rows(conn, "chemicals", "applications DESC")
-    pesticide_log = rows(conn, "pesticide_log", "date DESC, id DESC")
-    pest_pressure = rows(conn, "pest_pressure", "applications DESC")
-    pesticide_annual = rows(conn, "pesticide_annual", "year")
-    people = rows(conn, "people", "role, name")
-    organic_share = 100  # every product in the program is OMRI-listed / reduced-risk
-    total_apps = sum(a["applications"] for a in pesticide_annual)
-
-    eggs_monthly = rows(conn, "eggs_monthly", "month")
-    eggs_log = rows(conn, "eggs", "date DESC, id DESC")
-    livestock_costs = rows(conn, "livestock_costs", "id")
-    chicken_sourcing = rows(conn, "chicken_sourcing", "id")
-    total_eggs = sum(m["total"] for m in eggs_monthly)
-    total_brown = sum(m["brown"] for m in eggs_monthly)
-    total_other = sum(m["other"] for m in eggs_monthly)
-    chicken_spend = round(sum(x["cost"] for x in livestock_costs), 2)
-
-    kpis = {
-        "total_yield": round(total_yield),
-        "harvest_sub": f"{len(crops)} crops · {sum(c['beds'] for c in crops)} beds",
-        "families": round(cv("families")),
-        "families_sub": f"goal {round(cv('families','goal'))} households",
-        "utilization_pct": round(spent / grant_total * 100, 1) if grant_total else 0,
-        "grant_sub": f"${spent:,.0f} of ${grant_total:,.0f}",
-        "carbon": sv("carbon"),
-        "carbon_sub": f"benchmark {sv('carbon','benchmark')} tons",
-        "donated": round(cv("donated")),
-        "volunteer": round(cv("volunteer")),
-        "market": round(cv("market")),
-        "soil_health": sv("soil_health"),
-        "soil_moisture": sv("soil_moisture"),
-        "solar": sv("solar"),
-        "log_harvest": round(log_harvest),
-        "log_sub": f"{len(crop_log)} crops · {seedlings_total:,} seedlings · {germ_avg}% germ.",
-        "seedlings_total": seedlings_total,
-        "germ": germ_avg,
-        "lead_max": lead_max,
-        "active_alerts": active_alerts,
-        "alerts_sub": "impactful events flagged now" if active_alerts else "no active alerts",
-        "organic_share": organic_share,
-        "organic_sub": f"{len([ch for ch in chemicals if ch['caution']!='info'])} products · all OMRI-listed / reduced-risk",
-        "pest_apps": total_apps,
-        "pest_apps_sub": f"{pesticide_data.DATE_MIN[:4]}–{pesticide_data.DATE_MAX[:4]} · {len(pest_pressure)} pests tracked",
-        "total_eggs": total_eggs,
-        "eggs_sub": f"{total_brown} brown · {total_other} Easter-egger/blue · {len(eggs_monthly)} months",
-        "chicken_spend": chicken_spend,
-        "chicken_spend_sub": f"{len(livestock_costs)} purchases logged",
-    }
+    # Community / sustainability roll-ups
+    lbs_total = sum(r["lbs_dist"] for r in community)
+    families_peak = max((r["families"] for r in community), default=0)
+    volunteer_total = sum(r["volunteer_hrs"] for r in community)
+    csa_total = max((r["csa_shares"] for r in community), default=0)
+    carbon_total = sum(r["carbon_kg"] for r in sustainability)
+    water_total = sum(r["water_gal"] for r in sustainability)
+    solar_total = sum(r["solar_kwh"] for r in sustainability)
 
     return {
-        "kpis": kpis,
-        "crops": crops,
-        "crop_yield": {"labels": MONTHS, "series": named_series, "raw": yld},
-        "beds": rows(conn, "beds", "id"),
-        "sustainability": rows(conn, "sustainability", "rowid"),
-        "community": rows(conn, "community", "rowid"),
-        "tasks": rows(conn, "tasks", "due"),
+        "kpis": {
+            "utilization_pct": round(spent / grant_total * 100, 1) if grant_total else 0,
+            "spent": spent,
+            "grant_total": grant_total,
+            "total_yield": total_yield,
+            "total_acres": total_acres,
+            "crop_count": len({p["crop"] for p in plots}),
+            "plots_total": len(plots),
+            "plots_active": active,
+            "status_counts": status_counts,
+            "soil_health": settings.get("soil_health", 0),
+            "soil_moisture": settings.get("soil_moisture", 0),
+            "lbs_distributed": lbs_total,
+            "families_served": families_peak,
+            "volunteer_hours": volunteer_total,
+            "csa_shares": csa_total,
+            "carbon_kg": carbon_total,
+            "water_gal": water_total,
+            "solar_kwh": solar_total,
+        },
+        "plots": plots,
         "budget": budget,
-        "milestones": rows(conn, "milestones", "id"),
-        "inputs": rows(conn, "inputs", "rowid"),
-        "partners": rows(conn, "partners", "id"),
-        "crop_log": crop_log,
-        "harvest_trend": harvest_trend,
-        "soil_tests": soil_tests,
-        "weather": weather,
-        "weather_alerts": weather_alerts,
-        "chemicals": chemicals,
-        "pesticide_log": pesticide_log,
-        "pest_pressure": pest_pressure,
-        "pesticide_annual": pesticide_annual,
-        "eggs_monthly": eggs_monthly,
-        "eggs": eggs_log,
-        "egg_types": [{"label": "Brown", "value": total_brown},
-                      {"label": "Easter-Egger / Blue", "value": total_other}],
-        "livestock_costs": livestock_costs,
-        "chicken_sourcing": chicken_sourcing,
-        "people": people,
-        "roadmap": rows(conn, "roadmap", "rowid"),
+        "milestones": milestones,
+        "monthly_yield": {"labels": MONTHS, "series": series},
+        "inputs": inputs,
         "settings": settings,
-        "widgets": rows(conn, "widgets", "position, id"),
-        "sheets": rows(conn, "sheets", "id"),
+        "community": community,
+        "sustainability": sustainability,
+        "economics": economics,
+        "tasks": tasks,
+        "deadlines": deadlines,
+        "roadmap": roadmap,
+        "widgets": widgets,
+        "catalog": WIDGET_CATALOG,
+        "categories": CATEGORIES,
+        "sheets": sheets,
         "months": MONTHS,
+        "embodiment": EMBODIMENT,
+        "csa": csa_analytics(conn),
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Google Sheets sync (published-CSV, no credentials needed)
-# ─────────────────────────────────────────────────────────────────────────────
-def sync_sheet(conn, sheet):
-    table = sheet["target_table"]
-    url = (sheet["csv_url"] or "").strip()
-    spec = TABLES.get(table)
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    if not spec:
-        return _mark_sheet(conn, sheet["id"], now, f"Unknown table '{table}'")
-    if not url:
-        return _mark_sheet(conn, sheet["id"], now, "No CSV URL set")
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "AgriGrant/2.0"})
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            text = resp.read().decode("utf-8-sig", errors="replace")
-        reader = csv.DictReader(io.StringIO(text))
-        headers = [h.strip() for h in (reader.fieldnames or [])]
-        colmap = {c.lower(): c for c in spec["cols"]}
-        matched = [h for h in headers if h.lower() in colmap]
-        if spec["pk"] not in [colmap[h.lower()] for h in matched] and not spec["auto"]:
-            return _mark_sheet(conn, sheet["id"], now,
-                               f"CSV needs a '{spec['pk']}' column")
-        count = 0
-        for raw in reader:
-            row = {}
-            for h in matched:
-                col = colmap[h.lower()]
-                row[col] = cast_value(spec["cols"][col], raw.get(h))
-            if not row:
-                continue
-            upsert_row(conn, table, spec, row)
-            count += 1
-        conn.commit()
-        return _mark_sheet(conn, sheet["id"], now, f"OK — {count} rows synced")
-    except Exception as e:  # noqa: BLE001 — surface any sync failure to the UI
-        return _mark_sheet(conn, sheet["id"], now, f"Error: {e}")
+# ───────────────────────── Google Sheets sync ─────────────────────────
+
+def sheet_csv_url(url):
+    """Turn a normal Google Sheets share URL into a CSV export URL.
+
+    Accepts:
+      https://docs.google.com/spreadsheets/d/<ID>/edit#gid=<GID>
+      https://docs.google.com/spreadsheets/d/<ID>/edit?gid=<GID>
+      …/export?format=csv  (passed through)
+    The sheet must be shared as "Anyone with the link — Viewer".
+    """
+    if "format=csv" in url:
+        return url
+    m = re.search(r"/spreadsheets/d/([A-Za-z0-9_\-]+)", url)
+    if not m:
+        return None
+    sheet_id = m.group(1)
+    gid_m = re.search(r"[#?&]gid=(\d+)", url)
+    gid = gid_m.group(1) if gid_m else "0"
+    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
 
 
-def _mark_sheet(conn, sid, when, status):
-    conn.execute("UPDATE sheets SET last_synced=?, last_status=? WHERE id=?",
-                 (when, status, sid))
-    conn.commit()
-    return status
+def fetch_sheet_rows(url):
+    csv_url = sheet_csv_url(url)
+    if not csv_url:
+        raise ValueError("Not a recognizable Google Sheets URL")
+    req = urllib.request.Request(csv_url, headers={"User-Agent": "AgriGrant/1.0"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        raw = resp.read().decode("utf-8", "replace")
+    reader = csv.DictReader(io.StringIO(raw))
+    return [ {(k or "").strip(): (v or "").strip() for k, v in row.items()}
+             for row in reader ]
 
 
-def cast_value(t, v):
-    if v is None or v == "":
-        return 0 if t in (int, float) else ""
-    if t is int:
-        return int(float(v))
-    if t is float:
-        return float(v)
-    if t == "json":
-        return v if isinstance(v, str) else json.dumps(v)
-    return str(v)
+# Map each syncable table to (columns, key columns, casts). Headers in the
+# Google Sheet must match the column names (case-insensitive).
+SHEET_SCHEMA = {
+    "plots":          (["id", "crop", "acres", "yield_bu", "status", "x_pct", "y_pct"],
+                       ["id"], {"acres": float, "yield_bu": float, "x_pct": float, "y_pct": float}),
+    "budget":         (["category", "allocated", "spent"],
+                       ["category"], {"allocated": float, "spent": float}),
+    "monthly_yield":  (["month", "crop", "bushels"],
+                       ["month", "crop"], {"month": int, "bushels": float}),
+    "inputs":         (["name", "applied", "benchmark"],
+                       ["name"], {"applied": float, "benchmark": float}),
+    "community":      (["month", "lbs_dist", "families", "volunteer_hrs", "csa_shares"],
+                       ["month"], {"month": int, "lbs_dist": float, "families": int,
+                                   "volunteer_hrs": float, "csa_shares": int}),
+    "sustainability": (["month", "carbon_kg", "water_gal", "solar_kwh"],
+                       ["month"], {"month": int, "carbon_kg": float,
+                                   "water_gal": float, "solar_kwh": float}),
+    "economics":      (["crop", "cost", "revenue", "unit"],
+                       ["crop"], {"cost": float, "revenue": float}),
+}
 
 
-def upsert_row(conn, table, spec, row):
-    pk = spec["pk"]
-    cols = list(row.keys())
-    placeholders = ",".join("?" for _ in cols)
-    updates = ",".join(f"{c}=excluded.{c}" for c in cols if c != pk)
-    conflict = pk
-    if spec.get("unique"):
-        conflict = ",".join(spec["unique"])
-    sql = (f"INSERT INTO {table} ({','.join(cols)}) VALUES ({placeholders}) "
-           f"ON CONFLICT({conflict}) DO UPDATE SET {updates}") if updates else (
-           f"INSERT OR IGNORE INTO {table} ({','.join(cols)}) VALUES ({placeholders})")
-    conn.execute(sql, [row[c] for c in cols])
-
-
-def parse_xlsx(data):
-    """Read the first worksheet of an .xlsx file (stdlib only — no openpyxl).
-    Returns a list of {header: value} dicts using the first row as headers."""
-    import zipfile
-    from xml.etree import ElementTree as ET
-    NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
-    z = zipfile.ZipFile(io.BytesIO(data))
-    shared = []
-    if "xl/sharedStrings.xml" in z.namelist():
-        r = ET.fromstring(z.read("xl/sharedStrings.xml"))
-        for si in r.findall(NS + "si"):
-            shared.append("".join(t.text or "" for t in si.iter(NS + "t")))
-    sheets = sorted(n for n in z.namelist() if re.match(r"xl/worksheets/sheet\d+\.xml", n))
-    if not sheets:
-        return []
-    ws = ET.fromstring(z.read(sheets[0]))
-
-    def colnum(ref):
-        m = re.match(r"([A-Z]+)", ref or "A1")
-        s = 0
-        for ch in m.group(1):
-            s = s * 26 + (ord(ch) - 64)
-        return s - 1
-
-    grid = []
-    for row in ws.iter(NS + "row"):
-        cells = {}
-        for c in row.findall(NS + "c"):
-            t, v = c.get("t"), c.find(NS + "v")
-            val = ""
-            if v is not None:
-                val = shared[int(v.text)] if t == "s" else v.text
-            isv = c.find(NS + "is")
-            if isv is not None:
-                val = "".join(x.text or "" for x in isv.iter(NS + "t"))
-            cells[colnum(c.get("r"))] = val
-        grid.append(cells)
-    if not grid:
-        return []
-    width = max((max(c) + 1) if c else 0 for c in grid)
-    rows = [[c.get(i, "") for i in range(width)] for c in grid]
-    headers = [str(h).strip() for h in rows[0]]
-    out = []
-    for r in rows[1:]:
-        if not any(str(x).strip() for x in r):
+def sync_table(conn, target):
+    """Pull a Google Sheet and upsert it into `target`. Returns rows imported."""
+    if target not in SHEET_SCHEMA:
+        raise ValueError(f"{target} is not syncable")
+    row = conn.execute("SELECT sheet_url FROM sheet_sources WHERE target = ?",
+                       (target,)).fetchone()
+    if not row or not row["sheet_url"]:
+        raise ValueError("No sheet URL configured")
+    cols, keys, casts = SHEET_SCHEMA[target]
+    rows = fetch_sheet_rows(row["sheet_url"])
+    if not rows:
+        return 0
+    # Normalize header lookup (case-insensitive)
+    imported = 0
+    cur = conn.cursor()
+    for r in rows:
+        lower = {k.lower(): v for k, v in r.items()}
+        values = {}
+        ok = True
+        for col in cols:
+            if col.lower() not in lower:
+                # allow optional unit column to default
+                if col == "unit":
+                    values[col] = "season"
+                    continue
+                ok = False
+                break
+            raw = lower[col.lower()]
+            cast = casts.get(col)
+            try:
+                values[col] = cast(raw) if cast and raw != "" else (raw if not cast else 0)
+            except (TypeError, ValueError):
+                ok = False
+                break
+        if not ok:
             continue
-        out.append({headers[i]: r[i] for i in range(len(headers)) if headers[i]})
-    return out
-
-
-def ingest_records(conn, table, spec, records):
-    """Upsert a list of {header: value} dicts into a table. Headers are matched
-    to columns case-insensitively; unknown columns are ignored."""
-    colmap = {c.lower(): c for c in spec["cols"]}
-    count, skipped = 0, 0
-    for raw in records:
-        row = {}
-        for k, v in raw.items():
-            col = colmap.get(str(k).strip().lower())
-            if col:
-                row[col] = cast_value(spec["cols"][col], v)
-        if not row or (not spec["auto"] and spec["pk"] not in row):
-            skipped += 1
-            continue
-        upsert_row(conn, table, spec, row)
-        count += 1
+        placeholders = ",".join("?" for _ in cols)
+        updates = ",".join(f"{c}=excluded.{c}" for c in cols if c not in keys)
+        sql = (f"INSERT INTO {target} ({','.join(cols)}) VALUES ({placeholders}) "
+               f"ON CONFLICT({','.join(keys)}) DO UPDATE SET {updates}")
+        cur.execute(sql, tuple(values[c] for c in cols))
+        imported += 1
     conn.commit()
-    return count, skipped
+    return imported
 
 
-def sync_all():
-    conn = connect()
-    results = []
-    for sheet in rows(conn, "sheets"):
-        if sheet["enabled"]:
-            results.append({"table": sheet["target_table"],
-                            "status": sync_sheet(conn, sheet)})
-    conn.close()
-    return results
-
-
-def weekly_sync_loop():
-    while True:
-        time.sleep(SYNC_INTERVAL_SECONDS)
+def run_sync(target):
+    """Sync one table, recording status. Returns (ok, message)."""
+    with connect() as conn:
         try:
-            sync_all()
-        except Exception as e:  # noqa: BLE001
-            print("Weekly sync error:", e)
+            n = sync_table(conn, target)
+            conn.execute("UPDATE sheet_sources SET last_sync=?, last_status=? WHERE target=?",
+                         (now_iso(), f"OK — {n} rows", target))
+            conn.commit()
+            return True, f"Imported {n} rows into {target}"
+        except (urllib.error.URLError, ValueError, Exception) as e:
+            msg = f"Error: {e}"
+            conn.execute("UPDATE sheet_sources SET last_sync=?, last_status=? WHERE target=?",
+                         (now_iso(), msg[:200], target))
+            conn.commit()
+            return False, msg
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Live weather — Open-Meteo (climate) + NWS api.weather.gov (alerts). No API key.
-# ─────────────────────────────────────────────────────────────────────────────
-MIAMI_LAT, MIAMI_LON = 25.7617, -80.1918
-WEATHER_UA = "UrbanGreenWorksAlmanac/1.0 (Cerasee Farm dashboard)"
-
-
-def _nws_type(event):
-    e = (event or "").lower()
-    if "hurricane" in e or "tropical" in e: return "hurricane"
-    if "flood" in e or "surge" in e: return "flood"
-    if "heat" in e: return "heat"
-    if "fire" in e or "red flag" in e or "drought" in e: return "drought"
-    if "freeze" in e or "frost" in e or "cold" in e or "winter" in e: return "frost"
-    if "wind" in e or "tornado" in e: return "wind"
-    return "storm"
-
-
-def _nws_sev(sev):
-    return {"Extreme": "warning", "Severe": "warning", "Moderate": "watch",
-            "Minor": "advisory", "Unknown": "info"}.get(sev, "info")
-
-
-def _fetch_json(url, accept="application/json"):
-    req = urllib.request.Request(url, headers={"User-Agent": WEATHER_UA, "Accept": accept})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read().decode())
-
-
-def sync_weather(conn):
-    """Pull live Miami climate + active NWS alerts into the weather tables."""
-    msgs = []
-    # 1) Monthly climate — multi-year daily archive, averaged by calendar month.
-    try:
-        end = date.today() - timedelta(days=5)        # archive lags a few days
-        start = end.replace(year=end.year - 3)
-        url = ("https://archive-api.open-meteo.com/v1/archive"
-               f"?latitude={MIAMI_LAT}&longitude={MIAMI_LON}"
-               f"&start_date={start}&end_date={end}"
-               "&daily=precipitation_sum,temperature_2m_mean,temperature_2m_max"
-               "&temperature_unit=fahrenheit&precipitation_unit=inch"
-               "&timezone=America%2FNew_York")
-        d = _fetch_json(url)["daily"]
-        times, pr, tm, tx = d["time"], d["precipitation_sum"], d["temperature_2m_mean"], d["temperature_2m_max"]
-        ym_rain = {}                                  # (year,month) -> precip sum
-        mean_acc = {m: [0.0, 0] for m in range(1, 13)}
-        max_acc = {m: [0.0, 0] for m in range(1, 13)}
-        for i, t in enumerate(times):
-            y, m = int(t[0:4]), int(t[5:7])
-            ym_rain[(y, m)] = ym_rain.get((y, m), 0.0) + (pr[i] or 0)
-            if tm[i] is not None: mean_acc[m][0] += tm[i]; mean_acc[m][1] += 1
-            if tx[i] is not None: max_acc[m][0] += tx[i]; max_acc[m][1] += 1
-        rain_by_month = {m: [] for m in range(1, 13)}
-        for (y, m), tot in ym_rain.items():
-            rain_by_month[m].append(tot)
-        n = 0
-        for m in range(1, 13):
-            rl = rain_by_month[m]
-            rain = round(sum(rl) / len(rl), 1) if rl else 0
-            tav = round(mean_acc[m][0] / mean_acc[m][1]) if mean_acc[m][1] else 0
-            thi = round(max_acc[m][0] / max_acc[m][1]) if max_acc[m][1] else 0
-            conn.execute(
-                "INSERT INTO weather (month,label,rainfall_in,temp_avg_f,temp_high_f,note) VALUES (?,?,?,?,?,?) "
-                "ON CONFLICT(month) DO UPDATE SET rainfall_in=excluded.rainfall_in, "
-                "temp_avg_f=excluded.temp_avg_f, temp_high_f=excluded.temp_high_f, note=excluded.note",
-                (m, MONTHS[m - 1], rain, tav, thi,
-                 f"Live · {start.year}–{end.year} avg (Open-Meteo)"))
-            n += 1
-        conn.commit()
-        msgs.append(f"Climate: {n} months from Open-Meteo ({start.year}-{end.year}).")
-    except Exception as e:  # noqa: BLE001
-        msgs.append(f"Climate sync failed: {e}")
-
-    # 2) Active alerts — NWS for the Miami point.
-    try:
-        d = _fetch_json(f"https://api.weather.gov/alerts/active?point={MIAMI_LAT},{MIAMI_LON}",
-                        accept="application/geo+json")
-        feats = d.get("features", [])
-        conn.execute("DELETE FROM weather_alerts")
-        cnt = 0
-        for f in feats:
-            p = f.get("properties", {})
-            ev = p.get("event", "Weather Alert")
-            note = (p.get("headline") or p.get("description") or "").replace("\n", " ").strip()[:240]
-            conn.execute(
-                "INSERT INTO weather_alerts (type,severity,date,title,note,active) VALUES (?,?,?,?,?,1)",
-                (_nws_type(ev), _nws_sev(p.get("severity")),
-                 (p.get("effective") or "")[:10], ev, note))
-            cnt += 1
-        if cnt == 0:
-            conn.execute(
-                "INSERT INTO weather_alerts (type,severity,date,title,note,active) "
-                "VALUES ('storm','info',?,?,?,0)",
-                (str(date.today()), "No active alerts",
-                 "The National Weather Service reports no active watches or warnings for Miami right now."))
-        conn.commit()
-        msgs.append(f"Alerts: {cnt} active from NWS.")
-    except Exception as e:  # noqa: BLE001
-        msgs.append(f"Alert sync failed: {e}")
-
-    set_ai(conn, "weather_last_sync", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
-    conn.commit()
-    return " ".join(msgs)
-
-
-def weather_loop():
-    """Best-effort: sync once shortly after startup, then daily."""
-    time.sleep(6)
+def weekly_scheduler():
+    """Background thread: every hour, sync any enabled source whose last sync
+    was more than 7 days ago (or never)."""
     while True:
         try:
-            conn = connect()
-            print("Weather:", sync_weather(conn))
-            conn.close()
-        except Exception as e:  # noqa: BLE001
-            print("Weather sync error:", e)
-        time.sleep(24 * 60 * 60)
+            with connect() as conn:
+                rows = [dict(r) for r in conn.execute(
+                    "SELECT target, enabled, last_sync FROM sheet_sources WHERE enabled = 1")]
+            for r in rows:
+                due = True
+                if r["last_sync"]:
+                    try:
+                        last = datetime.fromisoformat(r["last_sync"])
+                        due = (datetime.now(timezone.utc) - last).total_seconds() > 7 * 86400
+                    except ValueError:
+                        due = True
+                if due:
+                    ok, msg = run_sync(r["target"])
+                    print(f"[weekly-sync] {r['target']}: {msg}")
+        except Exception as e:
+            print(f"[weekly-sync] scheduler error: {e}")
+        time.sleep(3600)  # check hourly; only syncs when 7 days have elapsed
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Cerasee — AI assistant (Anthropic Messages API over stdlib urllib, no SDK)
-# ─────────────────────────────────────────────────────────────────────────────
-DEFAULT_AI_MODEL = "claude-opus-4-8"
+# ───────────────────────────── HTTP handler ─────────────────────────────
 
-
-def get_ai(conn, key):
-    r = conn.execute("SELECT value FROM ai_settings WHERE key=?", (key,)).fetchone()
-    return r["value"] if r else None
-
-
-def set_ai(conn, key, value):
-    conn.execute(
-        "INSERT INTO ai_settings (key,value) VALUES (?,?) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (key, value))
-
-
-def ai_system_prompt(conn):
-    """Persona + a compact JSON snapshot of the live dashboard for grounding."""
-    p = dashboard_payload(conn)
-    data = {k: p[k] for k in (
-        "kpis", "crops", "crop_log", "harvest_trend", "soil_tests",
-        "sustainability", "community", "tasks", "budget", "milestones",
-        "partners", "beds", "inputs") if k in p}
-    return (
-        "You are Cerasee, a warm, knowledgeable assistant for the Urban GreenWorks Almanac dashboard of "
-        "Cerasee Farm & Urban GreenWorks — a nonprofit urban farm in Liberty City, Miami, "
-        "rooted in Caribbean growing traditions and regenerative agriculture. "
-        "Answer the user's questions about the farm using ONLY the dashboard data provided below. "
-        "Be concise, friendly, and specific — cite real numbers and units from the data "
-        "(pounds harvested, seedlings, soil lead in ppm, budget dollars, etc.). "
-        "Use simple dash bullets for lists. If something isn't in the data, say so plainly and "
-        "suggest what the farm could start tracking. Never invent figures.\n\n"
-        "LIVE DASHBOARD DATA (JSON):\n" + json.dumps(data, default=str)
-    )
-
-
-def call_anthropic(api_key, model, system, question):
-    """One-shot Messages API call. Returns the assistant text, or raises
-    ValueError with a user-friendly message on failure."""
-    payload = json.dumps({
-        "model": model or DEFAULT_AI_MODEL,
-        "max_tokens": 1024,
-        "system": system,
-        "messages": [{"role": "user", "content": question}],
-    }).encode()
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages", data=payload, method="POST",
-        headers={"Content-Type": "application/json",
-                 "x-api-key": api_key,
-                 "anthropic-version": "2023-06-01"})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read().decode())
-    except urllib.error.HTTPError as e:
-        try:
-            detail = json.loads(e.read().decode())["error"]["message"]
-        except Exception:  # noqa: BLE001
-            detail = f"HTTP {e.code}"
-        if e.code == 401:
-            raise ValueError("That API key was rejected. Check it under Manage Data -> Cerasee.")
-        if e.code == 429:
-            raise ValueError("Cerasee is rate-limited right now — please try again in a moment.")
-        raise ValueError(f"Anthropic API error: {detail}")
-    except urllib.error.URLError as e:
-        raise ValueError(f"Couldn't reach the Anthropic API ({e.reason}). "
-                         "Check the server's internet connection.")
-    if data.get("stop_reason") == "refusal":
-        return "I'm sorry — I can't help with that particular request."
-    parts = [b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"]
-    return "".join(parts).strip() or "(Cerasee returned an empty response.)"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# HTTP handler
-# ─────────────────────────────────────────────────────────────────────────────
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=BASE, **kwargs)
 
     def log_message(self, fmt, *args):
-        if not self.path.startswith("/api/dashboard"):  # keep poll noise down
+        if not self.path.startswith("/api/dashboard"):
             super().log_message(fmt, *args)
 
     # ---- helpers -------------------------------------------------
@@ -1441,236 +864,345 @@ class Handler(SimpleHTTPRequestHandler):
     def fail(self, msg, status=400):
         self.send_json({"error": msg}, status)
 
-    def coerce(self, spec, body, require_all=False):
-        """Validate/cast a body dict against a table spec. Returns (row, error)."""
-        row, pk, auto = {}, spec["pk"], spec["auto"]
-        for col, t in spec["cols"].items():
-            if col == pk and auto:
-                continue  # autoincrement — never set by client
-            if col in body and body[col] is not None:
-                try:
-                    row[col] = cast_value(t, body[col])
-                except (TypeError, ValueError):
-                    return None, f"{col} must be a {getattr(t,'__name__',t)}"
-            elif require_all and col == pk:
-                return None, f"{pk} is required"
-        return row, None
-
-    # ---- routing -------------------------------------------------
+    # ---- GET -----------------------------------------------------
     def do_GET(self):
         path = self.path.split("?")[0]
         if path == "/api/dashboard":
             with connect() as conn:
                 self.send_json(dashboard_payload(conn))
-        elif path == "/api/widget-catalog":
-            self.send_json(WIDGET_CATALOG)
-        elif path == "/api/ai/status":
+        elif path == "/api/catalog":
+            self.send_json({"catalog": WIDGET_CATALOG, "categories": CATEGORIES})
+        elif path == "/api/plots":
             with connect() as conn:
-                self.send_json({"configured": bool(get_ai(conn, "api_key")),
-                                "model": get_ai(conn, "model") or DEFAULT_AI_MODEL})
-        elif path == "/api/weather/status":
+                self.send_json([dict(r) for r in conn.execute("SELECT * FROM plots ORDER BY id")])
+        elif path == "/api/budget":
             with connect() as conn:
-                self.send_json({"last_sync": get_ai(conn, "weather_last_sync") or ""})
-        elif path == "/api/meta":
-            self.send_json({
-                "tables": {n: {"pk": s["pk"], "auto": s["auto"],
-                               "label": s["label"], "category": s["category"],
-                               "cols": {c: getattr(t, "__name__", t)
-                                        for c, t in s["cols"].items()}}
-                           for n, s in TABLES.items()},
-            })
-        elif path.startswith("/api/data/"):
-            table = path[len("/api/data/"):].split("/")[0]
-            if table not in TABLES:
-                return self.fail("unknown table", 404)
+                self.send_json([dict(r) for r in conn.execute("SELECT * FROM budget ORDER BY rowid")])
+        elif path == "/api/tasks":
             with connect() as conn:
-                self.send_json(rows(conn, table))
+                self.send_json([dict(r) for r in conn.execute("SELECT * FROM tasks ORDER BY status, due")])
+        elif path == "/api/sheets":
+            with connect() as conn:
+                self.send_json([dict(r) for r in conn.execute("SELECT * FROM sheet_sources ORDER BY target")])
         elif path.startswith("/api/"):
             self.fail("not found", 404)
         else:
             super().do_GET()
 
+    # ---- POST ----------------------------------------------------
     def do_POST(self):
         path = self.path.split("?")[0]
-        if path == "/api/upload":
-            return self.handle_upload()
-        if path == "/api/ai/ask":
-            return self.handle_ai_ask()
-        if path == "/api/weather/sync":
-            with connect() as conn:
-                msg = sync_weather(conn)
-                last = get_ai(conn, "weather_last_sync") or ""
-            return self.send_json({"message": msg, "last_sync": last})
-        if path == "/api/sync":
-            q = parse_qs(urlparse(self.path).query)
-            target = (q.get("table") or [None])[0]
-            with connect() as conn:
-                sheets = [s for s in rows(conn, "sheets")
-                          if (target in (None, "all", s["target_table"]))]
-                results = [{"table": s["target_table"], "status": sync_sheet(conn, s)}
-                           for s in sheets if s["enabled"] or target == s["target_table"]]
-            return self.send_json({"results": results})
-
-        m = re.fullmatch(r"/api/data/([\w]+)", path)
-        if not m:
-            return self.fail("not found", 404)
-        table = m.group(1)
-        spec = TABLES.get(table)
-        if not spec:
-            return self.fail("unknown table", 404)
         body = self.read_body()
         if body is None:
             return self.fail("invalid JSON body")
-        row, err = self.coerce(spec, body, require_all=True)
-        if err:
-            return self.fail(err)
-        cols = list(row.keys())
-        try:
+
+        if path == "/api/plots":
+            if not body.get("id") or not body.get("crop"):
+                return self.fail("id and crop are required")
+            status = body.get("status", "pending")
+            if status not in PLOT_STATUSES:
+                return self.fail(f"status must be one of {sorted(PLOT_STATUSES)}")
+            try:
+                with connect() as conn:
+                    conn.execute(
+                        "INSERT INTO plots VALUES (?,?,?,?,?,?,?)",
+                        (body["id"].strip(), body["crop"].strip(),
+                         float(body.get("acres", 0)), float(body.get("yield_bu", 0)),
+                         status, float(body.get("x_pct", 50)), float(body.get("y_pct", 50))))
+            except sqlite3.IntegrityError:
+                return self.fail(f"plot {body['id']} already exists", 409)
+            except (TypeError, ValueError):
+                return self.fail("acres, yield_bu, x_pct, y_pct must be numbers")
+            return self.send_json({"ok": True}, 201)
+
+        if path == "/api/tasks":
+            if not body.get("title"):
+                return self.fail("title is required")
+            if body.get("priority", "medium") not in TASK_PRIORITIES:
+                return self.fail(f"priority must be one of {sorted(TASK_PRIORITIES)}")
+            if body.get("status", "todo") not in TASK_STATUSES:
+                return self.fail(f"status must be one of {sorted(TASK_STATUSES)}")
             with connect() as conn:
+                cur = conn.execute(
+                    "INSERT INTO tasks (title, assignee, due, priority, status) VALUES (?,?,?,?,?)",
+                    (body["title"].strip(), body.get("assignee", "").strip(),
+                     body.get("due", "").strip(), body.get("priority", "medium"),
+                     body.get("status", "todo")))
+                tid = cur.lastrowid
+            return self.send_json({"ok": True, "id": tid}, 201)
+
+        if path == "/api/deadlines":
+            if not body.get("grant") or not body.get("item"):
+                return self.fail("grant and item are required")
+            with connect() as conn:
+                cur = conn.execute(
+                    "INSERT INTO deadlines (grant, item, due) VALUES (?,?,?)",
+                    (body["grant"].strip(), body["item"].strip(), body.get("due", "").strip()))
+                did = cur.lastrowid
+            return self.send_json({"ok": True, "id": did}, 201)
+
+        if path == "/api/roadmap":
+            if not body.get("item"):
+                return self.fail("item is required")
+            if body.get("status", "todo") not in ROADMAP_STATUSES:
+                return self.fail(f"status must be one of {sorted(ROADMAP_STATUSES)}")
+            with connect() as conn:
+                maxsort = conn.execute("SELECT COALESCE(MAX(sort),0) FROM roadmap").fetchone()[0]
+                cur = conn.execute(
+                    "INSERT INTO roadmap (phase, item, detail, due, category, status, sort) "
+                    "VALUES (?,?,?,?,?,?,?)",
+                    (body.get("phase", "").strip(), body["item"].strip(),
+                     body.get("detail", "").strip(), body.get("due", "").strip(),
+                     body.get("category", "general").strip(),
+                     body.get("status", "todo"), maxsort + 1))
+                rid = cur.lastrowid
+            return self.send_json({"ok": True, "id": rid}, 201)
+
+        if path == "/api/economics":
+            if not body.get("crop"):
+                return self.fail("crop is required")
+            try:
+                with connect() as conn:
+                    conn.execute(
+                        "INSERT INTO economics (crop, cost, revenue, unit) VALUES (?,?,?,?) "
+                        "ON CONFLICT(crop) DO UPDATE SET cost=excluded.cost, "
+                        "revenue=excluded.revenue, unit=excluded.unit",
+                        (body["crop"].strip(), float(body.get("cost", 0)),
+                         float(body.get("revenue", 0)), body.get("unit", "season")))
+            except (TypeError, ValueError):
+                return self.fail("cost and revenue must be numbers")
+            return self.send_json({"ok": True}, 201)
+
+        # Add a widget to the layout (or re-show a hidden one)
+        if path == "/api/widgets":
+            wid = body.get("wid")
+            if wid not in WIDGET_CATALOG:
+                return self.fail(f"unknown widget '{wid}'")
+            with connect() as conn:
+                maxsort = conn.execute("SELECT COALESCE(MAX(sort),0) FROM widgets").fetchone()[0]
                 conn.execute(
-                    f"INSERT INTO {table} ({','.join(cols)}) "
-                    f"VALUES ({','.join('?' for _ in cols)})",
-                    [row[c] for c in cols])
-                new_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        except sqlite3.IntegrityError as e:
-            return self.fail(f"already exists / constraint: {e}", 409)
-        self.send_json({"ok": True, "id": new_id}, 201)
+                    "INSERT INTO widgets (wid, sort, minimized, visible) VALUES (?,?,0,1) "
+                    "ON CONFLICT(wid) DO UPDATE SET visible=1, minimized=0",
+                    (wid, maxsort + 1))
+            return self.send_json({"ok": True}, 201)
 
-    def handle_ai_ask(self):
-        """Ask Cerasee a question about the dashboard. Returns 400 with
-        error 'no_api_key' if the key hasn't been configured yet."""
-        body = self.read_body()
-        if body is None:
-            return self.fail("invalid JSON body")
-        question = (body.get("question") or "").strip()
-        if not question:
-            return self.fail("question is required")
-        with connect() as conn:
-            api_key = get_ai(conn, "api_key")
-            model = get_ai(conn, "model") or DEFAULT_AI_MODEL
-            if not api_key:
-                return self.send_json({
-                    "error": "no_api_key",
-                    "message": "To ask Cerasee anything, add your Anthropic API key in the "
-                               "backend first (Manage Data -> Cerasee)."}, 400)
-            system = ai_system_prompt(conn)
-        try:
-            answer = call_anthropic(api_key, model, system, question)
-        except ValueError as e:
-            return self.send_json({"error": "ai_error", "message": str(e)}, 502)
-        self.send_json({"answer": answer, "model": model})
+        # Trigger an immediate Google Sheets sync for one target
+        if path == "/api/sheets/sync":
+            target = body.get("target")
+            if target not in SHEET_SCHEMA:
+                return self.fail(f"'{target}' is not syncable")
+            ok, msg = run_sync(target)
+            return self.send_json({"ok": ok, "message": msg}, 200 if ok else 502)
 
-    def handle_upload(self):
-        """Import a spreadsheet uploaded as the raw request body.
-        Query: ?table=<name>&name=<filename>.  Supports .xlsx and .csv."""
-        q = parse_qs(urlparse(self.path).query)
-        table = (q.get("table") or [""])[0]
-        fname = (q.get("name") or [""])[0].lower()
-        spec = TABLES.get(table)
-        if not spec:
-            return self.fail("unknown target table", 404)
-        length = int(self.headers.get("Content-Length") or 0)
-        data = self.rfile.read(length) if length else b""
-        if not data:
-            return self.fail("no file received")
-        try:
-            if fname.endswith(".csv") or fname.endswith(".txt"):
-                text = data.decode("utf-8-sig", errors="replace")
-                records = list(csv.DictReader(io.StringIO(text)))
-            elif fname.endswith(".xlsx"):
-                records = parse_xlsx(data)
-            else:
-                return self.fail("please upload a .xlsx or .csv file "
-                                 "(Word/PDF documents can't be auto-mapped to a table)")
-        except Exception as e:  # noqa: BLE001
-            return self.fail(f"could not read file: {e}")
-        if not records:
-            return self.fail("no data rows found in the file")
-        try:
-            with connect() as conn:
-                count, skipped = ingest_records(conn, table, spec, records)
-        except sqlite3.Error as e:
-            return self.fail(f"import failed: {e}")
-        note = f"Imported {count} row(s) into {table}"
-        if skipped:
-            note += f" ({skipped} skipped — missing '{spec['pk']}' or no matching columns)"
-        return self.send_json({"ok": True, "count": count, "skipped": skipped, "message": note})
+        return self.fail("not found", 404)
 
+    # ---- PUT -----------------------------------------------------
     def do_PUT(self):
         path = self.path.split("?")[0]
         body = self.read_body()
         if body is None:
             return self.fail("invalid JSON body")
 
-        if path == "/api/ai/config":
+        m = re.fullmatch(r"/api/plots/([\w\-]+)", path)
+        if m:
+            return self.update_row(
+                "plots", "id", m.group(1), body,
+                allowed={"crop": str, "acres": float, "yield_bu": float,
+                         "status": str, "x_pct": float, "y_pct": float},
+                validate=lambda b: (None if b.get("status") in PLOT_STATUSES or "status" not in b
+                                    else f"status must be one of {sorted(PLOT_STATUSES)}"))
+
+        m = re.fullmatch(r"/api/budget/([^/]+)", path)
+        if m:
+            return self.update_row("budget", "category", m.group(1), body,
+                                   allowed={"allocated": float, "spent": float})
+
+        m = re.fullmatch(r"/api/milestones/(\d+)", path)
+        if m:
+            return self.update_row(
+                "milestones", "id", int(m.group(1)), body,
+                allowed={"state": str, "label": str, "date": str},
+                validate=lambda b: (None if b.get("state") in MILESTONE_STATES or "state" not in b
+                                    else f"state must be one of {sorted(MILESTONE_STATES)}"))
+
+        m = re.fullmatch(r"/api/inputs/([^/]+)", path)
+        if m:
+            return self.update_row("inputs", "name", m.group(1), body,
+                                   allowed={"applied": float, "benchmark": float})
+
+        m = re.fullmatch(r"/api/economics/([^/]+)", path)
+        if m:
+            return self.update_row("economics", "crop", m.group(1), body,
+                                   allowed={"cost": float, "revenue": float, "unit": str})
+
+        m = re.fullmatch(r"/api/tasks/(\d+)", path)
+        if m:
+            return self.update_row(
+                "tasks", "id", int(m.group(1)), body,
+                allowed={"title": str, "assignee": str, "due": str,
+                         "priority": str, "status": str},
+                validate=lambda b: (
+                    f"priority must be one of {sorted(TASK_PRIORITIES)}"
+                    if b.get("priority") and b["priority"] not in TASK_PRIORITIES else
+                    f"status must be one of {sorted(TASK_STATUSES)}"
+                    if b.get("status") and b["status"] not in TASK_STATUSES else None))
+
+        m = re.fullmatch(r"/api/deadlines/(\d+)", path)
+        if m:
+            return self.update_row("deadlines", "id", int(m.group(1)), body,
+                                   allowed={"grant": str, "item": str, "due": str})
+
+        m = re.fullmatch(r"/api/roadmap/(\d+)", path)
+        if m:
+            return self.update_row(
+                "roadmap", "id", int(m.group(1)), body,
+                allowed={"phase": str, "item": str, "detail": str, "due": str,
+                         "category": str, "status": str, "sort": int},
+                validate=lambda b: (None if b.get("status") in ROADMAP_STATUSES or "status" not in b
+                                    else f"status must be one of {sorted(ROADMAP_STATUSES)}"))
+
+        m = re.fullmatch(r"/api/csa_prices/(.+)", path)
+        if m:
+            item = urllib.parse.unquote(m.group(1))
+            try:
+                price = float(body.get("price"))
+            except (TypeError, ValueError):
+                return self.fail("price must be a number")
             with connect() as conn:
-                if body.get("api_key"):
-                    set_ai(conn, "api_key", str(body["api_key"]).strip())
-                if body.get("model"):
-                    set_ai(conn, "model", str(body["model"]).strip())
+                conn.execute("INSERT INTO csa_prices (item, price) VALUES (?,?) "
+                             "ON CONFLICT(item) DO UPDATE SET price = excluded.price",
+                             (item, price))
             return self.send_json({"ok": True})
+
+        m = re.fullmatch(r"/api/settings/([\w]+)", path)
+        if m:
+            try:
+                value = float(body.get("value"))
+            except (TypeError, ValueError):
+                return self.fail("value must be a number")
+            with connect() as conn:
+                conn.execute("INSERT INTO settings VALUES (?,?) "
+                             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                             (m.group(1), value))
+            return self.send_json({"ok": True})
+
+        # Update widget state: minimized / visible / sort
+        m = re.fullmatch(r"/api/widgets/([\w]+)", path)
+        if m:
+            return self.update_row(
+                "widgets", "wid", m.group(1), body,
+                allowed={"minimized": int, "visible": int, "sort": int})
+
+        # Update community / sustainability month rows
+        m = re.fullmatch(r"/api/community/(\d+)", path)
+        if m:
+            return self.update_row(
+                "community", "month", int(m.group(1)), body,
+                allowed={"lbs_dist": float, "families": int,
+                         "volunteer_hrs": float, "csa_shares": int})
+
+        m = re.fullmatch(r"/api/sustainability/(\d+)", path)
+        if m:
+            return self.update_row(
+                "sustainability", "month", int(m.group(1)), body,
+                allowed={"carbon_kg": float, "water_gal": float, "solar_kwh": float})
+
+        # Configure a Google Sheets source
+        m = re.fullmatch(r"/api/sheets/([\w]+)", path)
+        if m:
+            target = m.group(1)
+            if target not in SHEET_SCHEMA:
+                return self.fail(f"'{target}' is not syncable")
+            return self.update_row(
+                "sheet_sources", "target", target, body,
+                allowed={"sheet_url": str, "enabled": int})
 
         if path == "/api/yield":
             try:
-                crop_id = str(body["crop_id"]).strip()
                 month = int(body["month"])
-                lbs = float(body["lbs"])
-                assert crop_id and 1 <= month <= 12
+                crop = str(body["crop"]).strip()
+                bushels = float(body["bushels"])
+                assert 1 <= month <= 12 and crop
             except (KeyError, TypeError, ValueError, AssertionError):
-                return self.fail("body must be {crop_id, month 1-12, lbs}")
+                return self.fail("body must be {month: 1-12, crop, bushels}")
             with connect() as conn:
-                conn.execute(
-                    "INSERT INTO crop_yield (crop_id,month,lbs) VALUES (?,?,?) "
-                    "ON CONFLICT(crop_id,month) DO UPDATE SET lbs=excluded.lbs",
-                    (crop_id, month, lbs))
+                conn.execute("INSERT INTO monthly_yield VALUES (?,?,?) "
+                             "ON CONFLICT(month, crop) DO UPDATE SET bushels = excluded.bushels",
+                             (month, crop, bushels))
             return self.send_json({"ok": True})
 
-        m = re.fullmatch(r"/api/data/([\w]+)/(.+)", path)
-        if not m:
-            return self.fail("not found", 404)
-        table, pk_val = m.group(1), m.group(2)
-        from urllib.parse import unquote
-        pk_val = unquote(pk_val)
-        spec = TABLES.get(table)
-        if not spec:
-            return self.fail("unknown table", 404)
-        if table in VALID_STATES and "state" in body and body["state"] not in VALID_STATES[table]:
-            return self.fail(f"state must be one of {sorted(VALID_STATES[table])}")
-        row, err = self.coerce(spec, body)
-        if err:
-            return self.fail(err)
-        row.pop(spec["pk"], None)  # don't rewrite the key
-        if not row:
-            return self.fail("no editable fields given")
-        sets = ",".join(f"{c}=?" for c in row)
+        self.fail("not found", 404)
+
+    # ---- DELETE --------------------------------------------------
+    def do_DELETE(self):
+        path = self.path.split("?")[0]
+
+        m = re.fullmatch(r"/api/plots/([\w\-]+)", path)
+        if m:
+            return self.delete_row("plots", "id", m.group(1))
+
+        m = re.fullmatch(r"/api/tasks/(\d+)", path)
+        if m:
+            return self.delete_row("tasks", "id", int(m.group(1)))
+
+        m = re.fullmatch(r"/api/deadlines/(\d+)", path)
+        if m:
+            return self.delete_row("deadlines", "id", int(m.group(1)))
+
+        m = re.fullmatch(r"/api/roadmap/(\d+)", path)
+        if m:
+            return self.delete_row("roadmap", "id", int(m.group(1)))
+
+        m = re.fullmatch(r"/api/economics/([^/]+)", path)
+        if m:
+            return self.delete_row("economics", "crop", m.group(1))
+
+        # Removing a widget hides it (keeps state so it can be re-added)
+        m = re.fullmatch(r"/api/widgets/([\w]+)", path)
+        if m:
+            with connect() as conn:
+                cur = conn.execute("UPDATE widgets SET visible = 0 WHERE wid = ?", (m.group(1),))
+            if cur.rowcount == 0:
+                return self.fail("widget not found", 404)
+            return self.send_json({"ok": True})
+
+        self.fail("not found", 404)
+
+    # ---- shared row ops -----------------------------------------
+    def update_row(self, table, key_col, key, body, allowed, validate=None):
+        if validate:
+            err = validate(body)
+            if err:
+                return self.fail(err)
+        fields, values = [], []
+        for col, cast in allowed.items():
+            if col in body:
+                try:
+                    values.append(cast(body[col]))
+                except (TypeError, ValueError):
+                    return self.fail(f"{col} has invalid type")
+                fields.append(f"{col} = ?")
+        if not fields:
+            return self.fail(f"no editable fields given (allowed: {sorted(allowed)})")
         with connect() as conn:
             cur = conn.execute(
-                f"UPDATE {table} SET {sets} WHERE {spec['pk']}=?",
-                [*row.values(), pk_val])
+                f"UPDATE {table} SET {', '.join(fields)} WHERE {key_col} = ?",
+                (*values, key))
         if cur.rowcount == 0:
-            return self.fail("row not found", 404)
+            return self.fail(f"{table} row not found", 404)
         self.send_json({"ok": True})
 
-    def do_DELETE(self):
-        m = re.fullmatch(r"/api/data/([\w]+)/(.+)", self.path.split("?")[0])
-        if not m:
-            return self.fail("not found", 404)
-        from urllib.parse import unquote
-        table, pk_val = m.group(1), unquote(m.group(2))
-        spec = TABLES.get(table)
-        if not spec:
-            return self.fail("unknown table", 404)
+    def delete_row(self, table, key_col, key):
         with connect() as conn:
-            cur = conn.execute(f"DELETE FROM {table} WHERE {spec['pk']}=?", (pk_val,))
+            cur = conn.execute(f"DELETE FROM {table} WHERE {key_col} = ?", (key,))
         if cur.rowcount == 0:
-            return self.fail("row not found", 404)
+            return self.fail(f"{table} row not found", 404)
         self.send_json({"ok": True})
 
 
 if __name__ == "__main__":
     init_db()
-    threading.Thread(target=weekly_sync_loop, daemon=True).start()
-    threading.Thread(target=weather_loop, daemon=True).start()
-    print(f"Urban GreenWorks Almanac backend on http://localhost:{PORT}  (db: {DB_PATH})")
-    print("Weekly Google Sheets sync is armed. Live Miami weather syncs on startup + daily.")
+    threading.Thread(target=weekly_scheduler, daemon=True).start()
+    print(f"AgriGrant backend on http://localhost:{PORT}  (db: {DB_PATH})")
+    print("Weekly Google Sheets sync scheduler: running (checks hourly)")
     ThreadingHTTPServer(("", PORT), Handler).serve_forever()
